@@ -15,7 +15,7 @@ using HexSBPSAT: make_element, make_operators, make_geometry,
                  apply_laplacian3d!, discrete_laplacian,
                  spectral_radius_estimate, discrete_inner_product,
                  discrete_l2_norm, physical_mass_diagonal, to_device
-using HexMeshes: make_cubical_mesh, make_cubed_cube_mesh
+using HexMeshes: make_uniform_hex, make_cubed_cube_mesh
 using KernelAbstractions: CPU
 using LinearAlgebra
 using Random
@@ -78,7 +78,7 @@ end
         M    = 2
         elem = make_element(T, N)
         ops  = make_operators(elem)
-        mesh = make_cubical_mesh(T, M, zero(T), one(T))
+        mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
         τ    = T(3//2) * (N - 1)^2
 
@@ -98,7 +98,7 @@ end
         M    = 2
         elem = make_element(T, N)
         ops  = make_operators(elem)
-        mesh = make_cubical_mesh(T, M, zero(T), one(T))
+        mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
         τ    = T(3//2) * (N - 1)^2
 
@@ -119,7 +119,7 @@ end
         M    = 2
         elem = make_element(T, N)
         ops  = make_operators(elem)
-        mesh = make_cubical_mesh(T, M, zero(T), one(T))
+        mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
         τ    = T(3//2) * (N - 1)^2
 
@@ -158,7 +158,7 @@ end
         M    = 4
         elem = make_element(T, N)
         ops  = make_operators(elem)
-        mesh = make_cubical_mesh(T, M, -one(T), one(T))   # [-1, 1]³
+        mesh = make_uniform_hex(T, M, -one(T), one(T))   # [-1, 1]³
         # Re-tag every outer face as Sommerfeld (7) to exercise the
         # free-face SAT path.
         for e in 1:mesh.Ne, f in 1:6
@@ -181,7 +181,7 @@ end
         M    = 2
         elem = make_element(T, N)
         ops  = make_operators(elem)
-        mesh = make_cubical_mesh(T, M, zero(T), one(T))
+        mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
 
         u = ones(T, N, N, N, mesh.Ne)
@@ -202,7 +202,7 @@ end
         M    = 2
         elem = make_element(T, N)
         ops  = make_operators(elem)
-        mesh = make_cubical_mesh(T, M, zero(T), one(T))
+        mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
         τ    = T(3//2) * (N - 1)^2
 
@@ -312,7 +312,7 @@ if HAS_METAL
         M    = 2
         elem = make_element(T, N)
         ops  = make_operators(elem)
-        mesh = make_cubical_mesh(T, M, zero(T), one(T))
+        mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
         τ    = T(3//2) * (N - 1)^2
         bdry = ntuple(_ -> zero(T), Val(6))
@@ -385,7 +385,7 @@ if HAS_CUDA
         M    = 2
         elem = make_element(T, N)
         ops  = make_operators(elem)
-        mesh = make_cubical_mesh(T, M, zero(T), one(T))
+        mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
         τ    = T(3//2) * (N - 1)^2
         bdry = ntuple(_ -> zero(T), Val(6))

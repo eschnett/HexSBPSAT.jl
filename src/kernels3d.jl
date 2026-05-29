@@ -107,7 +107,7 @@ using KernelAbstractions: @kernel, @index, @Const,
 @inline _face_volume_idx(::Val{3}, face_row, p, q) = (p, q, face_row)
 
 # Runtime variant used for the neighbour lookup (the neighbour's face
-# axis is known only at runtime from `mesh.neighbour_face`).
+# axis is known only at runtime from `mesh.conn.neighbour_face`).
 @inline function _face_volume_idx(a::Integer, face_row, p, q)
     if a == 1
         return (face_row, p, q)

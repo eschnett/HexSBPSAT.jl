@@ -16,9 +16,10 @@ downstream in `WaveToySecondOrder`.
                             the 1D and 3D kernels.
 * `kernels1d.jl`         — 1D `apply_laplacian!` (per-element + global)
                             and the diagnostic `build_global_laplacian`.
-* `geometry.jl`          — `MeshGeometry`, `make_geometry` (for both
-                            `HexMesh` and `InflatedCubeMesh`), device
-                            migration via `to_device`, and the
+* `geometry.jl`          — `MeshGeometry`, `make_geometry` (dispatches
+                            on per-element `PatchDesc.kind` to choose
+                            trilinear vs analytic-Jacobian path),
+                            device migration via `to_device`, and the
                             `Adapt.adapt_structure` rules used by KA at
                             launch time.
 * `kernels3d.jl`         — `apply_laplacian3d!`, the two `@kernel`s
@@ -34,19 +35,19 @@ module HexSBPSAT
 using Adapt
 using FastGaussQuadrature
 using HexMeshes
-using HexMeshes: HexMesh, InflatedCubeMesh, MeshConnectivity, PatchInfo,
-                 make_cubical_mesh, make_cubed_cube_mesh, make_inflated_cube_mesh,
-                 nv, element_vertices, locate_point, invert_element_map,
+using HexMeshes: Mesh, MeshConnectivity, PatchDesc, PatchKind,
+                 Cubic, Wedge, Inflation, Shell,
+                 make_uniform_hex, make_cubed_cube_mesh, make_inflated_cube_mesh,
+                 nv, npatches, element_vertices, locate_point, invert_element_map,
                  interpolate_field,
                  trilinear_shape, trilinear_dshape,
                  trilinear_map, trilinear_jacobian,
                  lagrange_basis, tensor_interp
 # `_patch_point_and_jac` is internal to `HexMeshes` but is needed by
-# `make_geometry(::InflatedCubeMesh, elem)` to evaluate the analytic
-# Jacobian on the curvilinear patches; `_neigh_pq` is also internal
-# but is read by `kernels3d.jl::_face_sat_compute!` to walk the D₄
-# orientation transform across an interior face. Pull both in
-# explicitly.
+# `make_geometry` to evaluate the analytic Jacobian on the curvilinear
+# patches; `_neigh_pq` is also internal but is read by
+# `kernels3d.jl::_face_sat_compute!` to walk the D₄ orientation
+# transform across an interior face. Pull both in explicitly.
 using HexMeshes: _patch_point_and_jac, _neigh_pq
 using KernelAbstractions
 using KrylovKit

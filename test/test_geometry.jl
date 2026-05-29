@@ -1,13 +1,13 @@
 # Tests for `HexSBPSAT/src/geometry.jl`: the operator-aware
-# `MeshGeometry`, both `make_geometry` methods, and `to_device` round-
-# trips on the CPU backend. The analytic-Jacobian / outer-sphere-
-# exactness assertions test that `make_geometry(::InflatedCubeMesh, …)`
-# composes the `HexMeshes` parametric patch maps correctly with the GLL
-# collocation grid.
+# `MeshGeometry`, `make_geometry`, and `to_device` round-trips on the
+# CPU backend. The analytic-Jacobian / outer-sphere-exactness
+# assertions test that `make_geometry` composes the `HexMeshes`
+# parametric patch maps correctly with the GLL collocation grid when
+# the mesh's `patch_desc` carries `Shell` and `Inflation` entries.
 
 using HexSBPSAT
 using HexSBPSAT: make_element, make_operators, make_geometry
-using HexMeshes: make_inflated_cube_mesh, is_shell
+using HexMeshes: make_inflated_cube_mesh, Shell
 using Test
 
 # `_progress` is defined in `runtests.jl`; fallback for stand-alone runs.
@@ -20,7 +20,8 @@ using Test
     _progress("inflated cube + make_geometry: analytic Jacobian is well-formed")
     @testset "make_inflated_cube_mesh: geometry is well-formed (M=3, N=4)" begin
         T = Float64
-        m    = make_inflated_cube_mesh(T, 1.0, 2.0, 4.0, 3)
+        R2_expected = 4.0
+        m    = make_inflated_cube_mesh(T, 1.0, 2.0, R2_expected, 3)
         elem = make_element(T, 4)
         g    = make_geometry(m, elem)
 
@@ -35,22 +36,26 @@ using Test
         r_all = sqrt.(g.coords[1, :, :, :, :].^2 .+
                       g.coords[2, :, :, :, :].^2 .+
                       g.coords[3, :, :, :, :].^2)
-        @test maximum(r_all) ≤ m.R2 + 1e-8
+        @test maximum(r_all) ≤ R2_expected + 1e-8
 
         # Shell-element outermost-radial face nodes lie on the outer
-        # sphere exactly (the analytic patch map evaluates `j_2`/`sinc`-
-        # style formulae; FP error is sub-1e-12).
+        # sphere exactly. A shell element on the outer face is one whose
+        # patch kind is `Shell` and whose `patch_idx[1]` equals the
+        # patch's radial element count `dims[1]` (i.e. the last radial
+        # element of that patch).
         shell_outer_max_err = 0.0
         for e in 1:m.Ne
-            pi_e = m.patch_info[e]
-            is_shell(pi_e.kind) || continue
-            pi_e.a_hi == 1.0 || continue
-            # Reference-cube ξ = 1 corresponds to a = a_hi = 1 ⇒ on R2.
+            pd = m.patch_desc[m.patch_id[e]]
+            pd.kind === Shell || continue
+            idx_radial = Int(m.patch_idx[1, e])
+            idx_radial == pd.shell.dims[1] || continue
+            # Reference-cube ξ = 1 (radial axis) corresponds to a = a_hi
+            # = 1 inside this last radial element ⇒ on R2.
             for k in 1:4, j in 1:4
                 r = sqrt(g.coords[1, 4, j, k, e]^2 +
                          g.coords[2, 4, j, k, e]^2 +
                          g.coords[3, 4, j, k, e]^2)
-                shell_outer_max_err = max(shell_outer_max_err, abs(r - m.R2))
+                shell_outer_max_err = max(shell_outer_max_err, abs(r - R2_expected))
             end
         end
         @test shell_outer_max_err < 1e-12

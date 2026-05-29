@@ -5,7 +5,7 @@
 # element data from `operators.jl` to materialise the per-node
 # Jacobian, |det J|, and physical-mass scratch the kernel reads.
 #
-# Imports `HexMesh`, `InflatedCubeMesh`, `MeshConnectivity`,
+# Imports `HexMesh`, `MeshConnectivity`, `PatchDesc`,
 # `_patch_point_and_jac`, `element_vertices`, `trilinear_map`,
 # `trilinear_jacobian` etc. from `HexMeshes` (loaded in
 # `HexSBPSAT.jl`).
@@ -101,7 +101,7 @@ coordinates, Jacobians, inverse Jacobians, and `|det J|` into a
 the caller retains ownership of the `HexMesh` (with its vertex data)
 for host-side queries.
 """
-function make_geometry(mesh::HexMesh{T}, elem) where {T}
+function make_geometry(mesh::Mesh{3, T}, elem) where {T}
     N  = elem.N
     ξs = elem.xs
     Ne = mesh.Ne
@@ -120,78 +120,13 @@ function make_geometry(mesh::HexMesh{T}, elem) where {T}
     Hphys      = Array{T, 4}(undef, N, N, N, Ne)
     face_trace = Array{T, 5}(undef, 4, N, N, 6, Ne)   # workspace, see struct doc
     handedness = Vector{Int8}(undef, Ne)
-    @inbounds for e in 1:Ne
-        verts = element_vertices(mesh, e)
-        # Sign of det(J) at element corner (ξ = η = ζ = 0). For a
-        # non-degenerate hex the sign is uniform throughout, so any
-        # single sample point determines the element's handedness.
-        J_corner   = trilinear_jacobian(verts, zero(T), zero(T), zero(T))
-        handedness[e] = det(J_corner) ≥ 0 ? Int8(1) : Int8(-1)
-        for k in 1:N, j in 1:N, i in 1:N
-            ξ, η, ζ = ξs[i], ξs[j], ξs[k]
-            p  = trilinear_map(verts, ξ, η, ζ)
-            J  = trilinear_jacobian(verts, ξ, η, ζ)
-            Ji = inv(J)
-            dJ = abs(det(J))
-            for a in 1:3
-                coords[a, i, j, k, e] = p[a]
-                for b in 1:3
-                    jac[a, b, i, j, k, e]    = J[a, b]
-                    invjac[a, b, i, j, k, e] = Ji[a, b]
-                end
-            end
-            detjac[i, j, k, e] = dJ
-            Hphys[i, j, k, e]  = H_1d[i] * H_1d[j] * H_1d[k] * dJ
-        end
-    end
-    return MeshGeometry{T, N}(Ne, mesh.conn,
-                              coords, jac, invjac, detjac, Hphys, face_trace, handedness)
-end
-
-"""
-    make_geometry(mesh::InflatedCubeMesh, elem) → MeshGeometry{T, N}
-
-Evaluate the per-element geometric map of every patch in `mesh` at the
-GLL collocation points of the reference element `elem`. Dispatches per
-element on `mesh.patch_info[e].kind`:
-
-* `kind == 0` (inner cube): trilinear interpolation of the 8 corners —
-  identical to `make_geometry(::HexMesh, elem)`.
-* `kind == 1..6` (inflation patch): analytic Jacobian from
-  `r(s, η, ζ) = (1 - s)·L + s · R₁ / √(1 + η² + ζ²)` evaluated through
-  `_patch_point_and_jac`.
-* `kind == 7..12` (shell patch): analytic Jacobian from
-  `r(ρ) = (1 - ρ)·R₁ + ρ·R₂`, also through `_patch_point_and_jac`.
-
-The returned `MeshGeometry` is interchangeable with one built from a
-plain `HexMesh`; downstream kernels are agnostic to the underlying
-mesh's curvature.
-"""
-function make_geometry(mesh::InflatedCubeMesh{T}, elem) where {T}
-    N  = elem.N
-    ξs = elem.xs
-    Ne = mesh.Ne
-
-    ops_ref = make_operators(elem)
-    H_1d    = SVector{N, T}(ntuple(i -> ops_ref.H[i, i], Val(N)))
-
-    coords     = Array{T, 5}(undef, 3, N, N, N, Ne)
-    jac        = Array{T, 6}(undef, 3, 3, N, N, N, Ne)
-    invjac     = Array{T, 6}(undef, 3, 3, N, N, N, Ne)
-    detjac     = Array{T, 4}(undef, N, N, N, Ne)
-    Hphys      = Array{T, 4}(undef, N, N, N, Ne)
-    face_trace = Array{T, 5}(undef, 4, N, N, 6, Ne)
-    handedness = Vector{Int8}(undef, Ne)
-
-    Lv  = mesh.L
-    R1v = mesh.R1
-    R2v = mesh.R2
 
     @inbounds for e in 1:Ne
-        pi = mesh.patch_info[e]
-        if HexMeshes.is_cubical(pi.kind)
-            # Trilinear path — inner cube
-            verts = element_vertices(mesh.base, e)
+        pd  = mesh.patch_desc[mesh.patch_id[e]]
+        # Trilinear path for `Cubic` and `Wedge`; analytic
+        # (`_patch_point_and_jac`) for `Inflation` and `Shell`.
+        if pd.kind === Cubic || pd.kind === Wedge
+            verts = element_vertices(mesh, e)
             J_c   = trilinear_jacobian(verts, zero(T), zero(T), zero(T))
             handedness[e] = det(J_c) ≥ 0 ? Int8(1) : Int8(-1)
             for k in 1:N, j in 1:N, i in 1:N
@@ -211,13 +146,13 @@ function make_geometry(mesh::InflatedCubeMesh{T}, elem) where {T}
                 Hphys[i, j, k, e]  = H_1d[i] * H_1d[j] * H_1d[k] * dJ
             end
         else
-            # Analytic curvilinear path — inflation / shell patch
-            _, J_c = _patch_point_and_jac(pi, T(0.5), T(0.5), T(0.5),
-                                          Lv, R1v, R2v)
+            # Analytic curvilinear path — Inflation / Shell.
+            idx = ntuple(d -> Int(mesh.patch_idx[d, e]), Val(3))
+            _, J_c = _patch_point_and_jac(pd, idx, T(0.5), T(0.5), T(0.5))
             handedness[e] = det(J_c) ≥ 0 ? Int8(1) : Int8(-1)
             for k in 1:N, j in 1:N, i in 1:N
                 ξ, η, ζ = ξs[i], ξs[j], ξs[k]
-                p, J = _patch_point_and_jac(pi, ξ, η, ζ, Lv, R1v, R2v)
+                p, J = _patch_point_and_jac(pd, idx, ξ, η, ζ)
                 Ji = inv(J)
                 dJ = abs(det(J))
                 for a in 1:3
@@ -240,7 +175,7 @@ end
 # Device migration
 
 """
-    to_device(mesh::HexMesh, backend) → HexMesh
+    to_device(mesh::Mesh{3}, backend) → Mesh{3}
     to_device(geom::MeshGeometry, backend) → MeshGeometry
 
 Move every kernel-read array of `mesh` / `geom` onto `backend` (a
@@ -256,25 +191,25 @@ backend just calls `Array{T}(undef, …)`. Round-tripping through
 `to_device(g, CPU())` is therefore a valid smoke test that exercises
 the migration path without requiring a GPU.
 """
-function to_device(mesh::HexMesh{T}, backend) where {T}
-    nb  = KernelAbstractions.allocate(backend, Int32, size(mesh.neighbour))
-    nbf = KernelAbstractions.allocate(backend, Int8, size(mesh.neighbour_face))
-    ori = KernelAbstractions.allocate(backend, Int8, size(mesh.orientation))
-    bdr = KernelAbstractions.allocate(backend, Int8, size(mesh.bdry))
-    copyto!(nb,  mesh.neighbour)
-    copyto!(nbf, mesh.neighbour_face)
-    copyto!(ori, mesh.orientation)
-    copyto!(bdr, mesh.bdry)
+function to_device(mesh::Mesh{3, T}, backend) where {T}
+    nb  = KernelAbstractions.allocate(backend, Int32, size(mesh.conn.neighbour))
+    nbf = KernelAbstractions.allocate(backend, Int8, size(mesh.conn.neighbour_face))
+    ori = KernelAbstractions.allocate(backend, Int8, size(mesh.conn.orientation))
+    bdr = KernelAbstractions.allocate(backend, Int8, size(mesh.conn.bdry))
+    copyto!(nb,  mesh.conn.neighbour)
+    copyto!(nbf, mesh.conn.neighbour_face)
+    copyto!(ori, mesh.conn.orientation)
+    copyto!(bdr, mesh.conn.bdry)
     # 3D-specific for now; HexSBPSAT generalization to D=1,2 is deferred.
-    # The mesh's D parameter is implicit in `mesh::HexMesh` = `Mesh{3}`.
     new_conn = MeshConnectivity{3}(nb, nbf, ori, bdr)
-    return HexMesh{T}(mesh.Ne, new_conn, mesh.vertex_coords, mesh.vertex_idx)
-end
-
-function to_device(mesh::InflatedCubeMesh{T}, backend) where {T}
-    base_dev = to_device(mesh.base, backend)
-    return InflatedCubeMesh(base_dev, mesh.patch_info, mesh.L, mesh.R1, mesh.R2,
-                            mesh.M, mesh.Mi, mesh.Ms)
+    # Host-only fields (`vertex_coords`, `vertex_idx`, patch metadata)
+    # stay as plain CPU `Matrix` / `Vector` since they're never read by
+    # kernels — only by host-side queries and `make_geometry`.
+    return Mesh{3, T}(mesh.Ne, new_conn, mesh.vertex_coords, mesh.vertex_idx;
+                      patch_id              = mesh.patch_id,
+                      patch_idx             = mesh.patch_idx,
+                      patch_desc            = mesh.patch_desc,
+                      patch_element_offset  = mesh.patch_element_offset)
 end
 
 function to_device(geom::MeshGeometry{T, N}, backend) where {T, N}
@@ -349,5 +284,4 @@ Thin wrapper that returns just the physical collocation coordinates from
 `make_geometry(mesh, elem)`. Prefer `make_geometry` when you also need the
 per-node Jacobian.
 """
-element_coords(mesh::HexMesh, elem) = make_geometry(mesh, elem).coords
-element_coords(mesh::InflatedCubeMesh, elem) = make_geometry(mesh, elem).coords
+element_coords(mesh::Mesh{3}, elem) = make_geometry(mesh, elem).coords
