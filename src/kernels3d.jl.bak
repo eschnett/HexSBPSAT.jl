@@ -570,7 +570,7 @@ end
     # ---- Face SAT: 6 faces, each compute + apply, with barriers ----
 
     # Face 1: compute, sync, apply, sync.
-    _face_sat_compute!(Val(1), face_buf, i, j, k, e, geom, work, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
+    _face_sat_compute!(Val(\1), face_buf, i, j, k, e, geom, work, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
     @synchronize
     e       = @index(Group, Linear); li = @index(Local, Linear)
     i, j, k = _ijk_from_li(li, Val(N))
@@ -580,7 +580,7 @@ end
     # Face 2.
     e       = @index(Group, Linear); li = @index(Local, Linear)
     i, j, k = _ijk_from_li(li, Val(N))
-    _face_sat_compute!(Val(2), face_buf, i, j, k, e, geom, work, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
+    _face_sat_compute!(Val(\1), face_buf, i, j, k, e, geom, work, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
     @synchronize
     e       = @index(Group, Linear); li = @index(Local, Linear)
     i, j, k = _ijk_from_li(li, Val(N))
@@ -590,7 +590,7 @@ end
     # Face 3.
     e       = @index(Group, Linear); li = @index(Local, Linear)
     i, j, k = _ijk_from_li(li, Val(N))
-    _face_sat_compute!(Val(3), face_buf, i, j, k, e, geom, work, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
+    _face_sat_compute!(Val(\1), face_buf, i, j, k, e, geom, work, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
     @synchronize
     e       = @index(Group, Linear); li = @index(Local, Linear)
     i, j, k = _ijk_from_li(li, Val(N))
@@ -600,7 +600,7 @@ end
     # Face 4.
     e       = @index(Group, Linear); li = @index(Local, Linear)
     i, j, k = _ijk_from_li(li, Val(N))
-    _face_sat_compute!(Val(4), face_buf, i, j, k, e, geom, work, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
+    _face_sat_compute!(Val(\1), face_buf, i, j, k, e, geom, work, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
     @synchronize
     e       = @index(Group, Linear); li = @index(Local, Linear)
     i, j, k = _ijk_from_li(li, Val(N))
@@ -610,7 +610,7 @@ end
     # Face 5.
     e       = @index(Group, Linear); li = @index(Local, Linear)
     i, j, k = _ijk_from_li(li, Val(N))
-    _face_sat_compute!(Val(5), face_buf, i, j, k, e, geom, work, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
+    _face_sat_compute!(Val(\1), face_buf, i, j, k, e, geom, work, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
     @synchronize
     e       = @index(Group, Linear); li = @index(Local, Linear)
     i, j, k = _ijk_from_li(li, Val(N))
@@ -620,7 +620,7 @@ end
     # Face 6.
     e       = @index(Group, Linear); li = @index(Local, Linear)
     i, j, k = _ijk_from_li(li, Val(N))
-    _face_sat_compute!(Val(6), face_buf, i, j, k, e, geom, work, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
+    _face_sat_compute!(Val(\1), face_buf, i, j, k, e, geom, work, geom.conn, ops, τ, bdry_values, H_1d, Val(N))
     @synchronize
     e       = @index(Group, Linear); li = @index(Local, Linear)
     i, j, k = _ijk_from_li(li, Val(N))
@@ -689,10 +689,7 @@ representative mesh.
 """
 function apply_laplacian!(ü::AbstractArray{T,4}, u::AbstractArray{T,4},
                              bdry_values::NTuple{6, T};
-                             geom::MeshGeometry{3, T, N},
-                             ops::SBPOps{N, T},
-                             work::MeshWorkspace{3, T, N},
-                             τ) where {N, T}
+                             geom::MeshGeometry{3, T, N}, ops::SBPOps{N, T}, τ) where {N, T}
     @assert size(ü) == size(u)
     @assert size(u, 1) == size(u, 2) == size(u, 3) == N
     @assert size(u, 4) == geom.Ne
@@ -707,10 +704,10 @@ function apply_laplacian!(ü::AbstractArray{T,4}, u::AbstractArray{T,4},
     # explicit `synchronize`. Both kernels use the same workgroup-
     # per-element layout (N³ workitems/workgroup, one per node).
     _laplacian3d_face_trace_kernel!(backend, N^3)(
-        u, geom, work, ops, Val(N);
+        u, geom, ops, Val(N);
         ndrange = N^3 * geom.Ne)
     _laplacian3d_volume_kernel!(backend, N^3)(
-        ü, u, geom, work, ops, T(τ), bdry_values, H_1d, Val(N);
+        ü, u, geom, ops, T(τ), bdry_values, H_1d, Val(N);
         ndrange = N^3 * geom.Ne)
 
     return ü
@@ -759,7 +756,6 @@ function discrete_laplacian(geom::MeshGeometry{3, T, N}, ops::SBPOps{N, T}, τ;
     ndof = N^3 * Ne
     u  = zeros(T, N, N, N, Ne)
     ü = similar(u)
-    work = make_workspace(geom)
 
     I_idx = Int[];  J_idx = Int[];  V = T[]
     sizehint!(I_idx, 64 * ndof);  sizehint!(J_idx, 64 * ndof);  sizehint!(V, 64 * ndof)
@@ -768,7 +764,7 @@ function discrete_laplacian(geom::MeshGeometry{3, T, N}, ops::SBPOps{N, T}, τ;
     ü_flat = vec(ü)
     @inbounds for col in 1:ndof
         u_flat[col] = one(T)
-        apply_laplacian!(ü, u, bdry_values; geom, ops, work, τ)
+        apply_laplacian!(ü, u, bdry_values; geom, ops, τ)
         u_flat[col] = zero(T)
         for row in 1:ndof
             v = ü_flat[row]
@@ -836,7 +832,6 @@ function spectral_radius_estimate(geom::MeshGeometry{3, T, N}, ops::SBPOps{N, T}
     bdry = ntuple(_ -> zero(T), Val(6))
 
     backend = get_backend(geom.coords)
-    work    = make_workspace(geom)
 
     # Random starting vector (same backend as geom).
     x₀ = KernelAbstractions.allocate(backend, T, N, N, N, Ne)
@@ -848,10 +843,10 @@ function spectral_radius_estimate(geom::MeshGeometry{3, T, N}, ops::SBPOps{N, T}
     # Matrix-free shell: `y = L_h · x`. `eigsolve` calls this many
     # times; the per-call allocation of `y` is dominated by the
     # operator work, so out-of-place is fine.
-    apply_Lh = let geom = geom, ops = ops, work = work, τ = τ, bdry = bdry
+    apply_Lh = let geom = geom, ops = ops, τ = τ, bdry = bdry
         x -> begin
             y = similar(x)
-            apply_laplacian!(y, x, bdry; geom, ops, work, τ)
+            apply_laplacian!(y, x, bdry; geom, ops, τ)
             return y
         end
     end

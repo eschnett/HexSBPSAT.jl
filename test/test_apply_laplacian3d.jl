@@ -1,4 +1,4 @@
-# Tests for `apply_laplacian3d!` — the curvilinear-aware 3D SBP-DG
+# Tests for `apply_laplacian!` — the curvilinear-aware 3D SBP-DG
 # Laplacian — and its diagnostics (`discrete_laplacian`,
 # `spectral_radius_estimate`, `discrete_inner_product`,
 # `discrete_l2_norm`). Equation-free: no wave-equation evolution, no
@@ -12,7 +12,8 @@
 
 using HexSBPSAT
 using HexSBPSAT: make_element, make_operators, make_geometry,
-                 apply_laplacian3d!, discrete_laplacian,
+                 make_workspace,
+                 apply_laplacian!, discrete_laplacian,
                  spectral_radius_estimate, discrete_inner_product,
                  discrete_l2_norm, physical_mass_diagonal, to_device
 using HexMeshes: make_uniform_hex, make_cubed_cube_mesh
@@ -62,7 +63,7 @@ catch
     false
 end
 
-@testset "apply_laplacian3d! (T=$T)" for T in (Float64, Float32)
+@testset "apply_laplacian! 3D (T=$T)" for T in (Float64, Float32)
 
     # Float32 has ~1e-7 round-off; relax assembled-matrix tolerances
     # accordingly. The qualitative correctness check (symmetry, NSD,
@@ -109,10 +110,10 @@ end
         @test isapprox(λ_iter, λ_dense; rtol = sr_rtol)
     end
 
-    _progress("apply_laplacian3d! tag-7 free face contributes nothing (T=$T)")
+    _progress("apply_laplacian! tag-7 free face contributes nothing (T=$T)")
     @testset "tag-7 face is a free face (T=$T)" begin
         # Inject a wave-equation-style tag-7 on every outer face and verify
-        # that apply_laplacian3d!'s output:
+        # that apply_laplacian!'s output:
         #   1. differs from the Dirichlet-default version (tag-7 = no SAT)
         #   2. stays finite (clean no-op, not NaN-producing skip).
         N    = 3
@@ -121,11 +122,12 @@ end
         ops  = make_operators(elem)
         mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
+        work = make_workspace(geom)
         τ    = T(3//2) * (N - 1)^2
 
         u   = randn(T, N, N, N, mesh.Ne)
         ü_d = similar(u)
-        apply_laplacian3d!(ü_d, u, ntuple(_ -> zero(T), Val(6)); geom, ops, τ)
+        apply_laplacian!(ü_d, u, ntuple(_ -> zero(T), Val(6)); geom, ops, work, τ)
 
         # Re-tag every outer face as `7` and re-evaluate.
         for e in 1:mesh.Ne, f in 1:6
@@ -134,7 +136,7 @@ end
             end
         end
         ü_s = similar(u)
-        apply_laplacian3d!(ü_s, u, ntuple(_ -> zero(T), Val(6)); geom, ops, τ)
+        apply_laplacian!(ü_s, u, ntuple(_ -> zero(T), Val(6)); geom, ops, work, τ)
 
         @test ü_d != ü_s
         @test all(isfinite, ü_s)
@@ -167,10 +169,11 @@ end
             end
         end
         geom = make_geometry(mesh, elem)
+        work = make_workspace(geom)
         u = T.(geom.coords[1, :, :, :, :] .^ 2)
         ü = similar(u)
         τ = T(3//2) * (N - 1)^2
-        apply_laplacian3d!(ü, u, ntuple(_ -> zero(T), Val(6)); geom, ops, τ)
+        apply_laplacian!(ü, u, ntuple(_ -> zero(T), Val(6)); geom, ops, work, τ)
         # Exact in floating-point arithmetic for this polynomial degree.
         @test maximum(abs, ü .- T(2)) < 100 * eps(T)
     end
@@ -210,11 +213,14 @@ end
         @test geom_dev.coords ≈ geom.coords
         @test geom_dev !== geom
 
+        work     = make_workspace(geom)
+        work_dev = to_device(work, CPU())
+
         u  = randn(T, N, N, N, mesh.Ne)
         bdry = ntuple(_ -> zero(T), Val(6))
         ü_host = similar(u); ü_dev = similar(u)
-        apply_laplacian3d!(ü_host, u, bdry; geom,            ops, τ)
-        apply_laplacian3d!(ü_dev,  u, bdry; geom = geom_dev, ops, τ)
+        apply_laplacian!(ü_host, u, bdry; geom,            ops, work,             τ)
+        apply_laplacian!(ü_dev,  u, bdry; geom = geom_dev, ops, work = work_dev, τ)
         @test ü_host == ü_dev
     end
 
@@ -224,7 +230,7 @@ end
 #
 # Regression test for the docstring claim that the SIPG penalty
 # `τ ≈ 8·(N-1)²` is sufficient on curvilinear / multi-patch meshes
-# (cubed cube, inflated cube). At lower τ the bare `apply_laplacian3d!`
+# (cubed cube, inflated cube). At lower τ the bare `apply_laplacian!`
 # operator has growing modes at higher (N, M) — even with Dirichlet
 # outer BC and no Sommerfeld pass — that manifest as exponential blowup
 # under symplectic time-stepping.
@@ -240,9 +246,10 @@ end
     elem = make_element(T, N)
     ops  = make_operators(elem)
     # Dirichlet outer (no Sommerfeld pass) — Bug 2 is in the bare
-    # `apply_laplacian3d!`, not in the Sommerfeld SAT layered on top.
+    # `apply_laplacian!`, not in the Sommerfeld SAT layered on top.
     mesh = make_inflated_cube_mesh(T, T(0.1), T(0.3), T(1.0), M)
     geom = make_geometry(mesh, elem)
+    work = make_workspace(geom)
     τ = T(8) * (N - 1)^2
 
     bdry = ntuple(_ -> zero(T), Val(6))
@@ -264,7 +271,7 @@ end
     # and the energy grows without bound.
     function energy(u, u̇)
         Lu = similar(u)
-        apply_laplacian3d!(Lu, u, bdry; geom, ops, τ)
+        apply_laplacian!(Lu, u, bdry; geom, ops, work, τ)
         K = discrete_inner_product(u̇, u̇, geom, ops) / 2
         V = -discrete_inner_product(u, Lu, geom, ops) / 2
         return K, V, K + V
@@ -272,14 +279,14 @@ end
     K0, V0, E0 = energy(u, u̇)
     @test V0 > 0   # `L_h` is NSD ⇒ ⟨u, −L_h u⟩ ≥ 0 for any u
 
-    # Manual leapfrog (Störmer–Verlet) using only `apply_laplacian3d!`
+    # Manual leapfrog (Störmer–Verlet) using only `apply_laplacian!`
     # — no OrdinaryDiffEq / wave-specific `recommended_dt` dependency.
-    apply_laplacian3d!(ü, u, bdry; geom, ops, τ)
+    apply_laplacian!(ü, u, bdry; geom, ops, work, τ)
     u̇ .+= (dt / 2) .* ü
     n_steps = 100
     for _ in 1:n_steps
         u .+= dt .* u̇
-        apply_laplacian3d!(ü, u, bdry; geom, ops, τ)
+        apply_laplacian!(ü, u, bdry; geom, ops, work, τ)
         u̇ .+= dt .* ü
     end
     u̇ .-= (dt / 2) .* ü   # align u̇ back to integer step for energy diag
@@ -299,14 +306,14 @@ end
 # the GPU:
 #   • `to_device(geom, MetalBackend())` migrates geometry
 #   • state allocated as `MtlArray{Float32}`
-#   • `apply_laplacian3d!` runs on Metal
+#   • `apply_laplacian!` runs on Metal
 #   • `discrete_inner_product` runs on Metal (GPUArrays mapreduce)
 #   • `spectral_radius_estimate` runs on Metal (KrylovKit + matrix-free)
 # and that the final result matches the host path within Float32
 # round-off.
 if HAS_METAL
-    @testset "apply_laplacian3d! on Metal (Float32)" begin
-        _progress("Metal: to_device + apply_laplacian3d! match CPU")
+    @testset "apply_laplacian! on Metal (Float32)" begin
+        _progress("Metal: to_device + apply_laplacian! match CPU")
         T    = Float32
         N    = 4
         M    = 2
@@ -314,6 +321,7 @@ if HAS_METAL
         ops  = make_operators(elem)
         mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
+        work = make_workspace(geom)
         τ    = T(3//2) * (N - 1)^2
         bdry = ntuple(_ -> zero(T), Val(6))
 
@@ -321,15 +329,16 @@ if HAS_METAL
         Random.seed!(20260528)
         u_host  = randn(T, N, N, N, mesh.Ne)
         ü_host  = similar(u_host)
-        apply_laplacian3d!(ü_host, u_host, bdry; geom, ops, τ)
+        apply_laplacian!(ü_host, u_host, bdry; geom, ops, work, τ)
 
         # Migrate geometry + state to Metal.
         backend  = MetalBackend()
         geom_dev = to_device(geom, backend)
+        work_dev = to_device(work, backend)
         u_dev    = MtlArray(u_host)
         ü_dev    = MtlArray(zeros(T, N, N, N, mesh.Ne))
 
-        apply_laplacian3d!(ü_dev, u_dev, bdry; geom = geom_dev, ops, τ)
+        apply_laplacian!(ü_dev, u_dev, bdry; geom = geom_dev, ops, work = work_dev, τ)
         @test Array(ü_dev) ≈ ü_host
 
         _progress("Metal: discrete_inner_product matches CPU")
@@ -364,7 +373,7 @@ end
 # Verifies the same operator chain the Metal testset checks:
 #   • `to_device(geom, CUDABackend())` migrates geometry
 #   • state allocated as `CuArray{T}`
-#   • `apply_laplacian3d!` runs on CUDA
+#   • `apply_laplacian!` runs on CUDA
 #   • `discrete_inner_product` runs on CUDA (GPUArrays mapreduce)
 #   • `spectral_radius_estimate` runs on CUDA (KrylovKit + matrix-free)
 #
@@ -376,8 +385,8 @@ end
 # mismatch on cards with non-IEEE FMA semantics.
 if HAS_CUDA
     cuda_types = HAS_CUDA_FP64 ? (Float32, Float64) : (Float32,)
-    @testset "apply_laplacian3d! on CUDA (T=$T)" for T in cuda_types
-        _progress("CUDA: to_device + apply_laplacian3d! match CPU (T=$T)")
+    @testset "apply_laplacian! on CUDA (T=$T)" for T in cuda_types
+        _progress("CUDA: to_device + apply_laplacian! match CPU (T=$T)")
         # Sized for cheap CI: a single 2×2×2 cube of N=4 GLL nodes per
         # element. The host reference is computed first so any device
         # divergence shows up directly.
@@ -387,6 +396,7 @@ if HAS_CUDA
         ops  = make_operators(elem)
         mesh = make_uniform_hex(T, M, zero(T), one(T))
         geom = make_geometry(mesh, elem)
+        work = make_workspace(geom)
         τ    = T(3//2) * (N - 1)^2
         bdry = ntuple(_ -> zero(T), Val(6))
 
@@ -394,15 +404,16 @@ if HAS_CUDA
         Random.seed!(20260528)
         u_host  = randn(T, N, N, N, mesh.Ne)
         ü_host  = similar(u_host)
-        apply_laplacian3d!(ü_host, u_host, bdry; geom, ops, τ)
+        apply_laplacian!(ü_host, u_host, bdry; geom, ops, work, τ)
 
         # Migrate geometry + state to CUDA.
         backend  = CUDABackend()
         geom_dev = to_device(geom, backend)
+        work_dev = to_device(work, backend)
         u_dev    = CuArray(u_host)
         ü_dev    = CuArray(zeros(T, N, N, N, mesh.Ne))
 
-        apply_laplacian3d!(ü_dev, u_dev, bdry; geom = geom_dev, ops, τ)
+        apply_laplacian!(ü_dev, u_dev, bdry; geom = geom_dev, ops, work = work_dev, τ)
         # GPUs are free to issue FMAs that the CPU path may have
         # separated; allow a tight ULP-scaled tolerance instead of
         # bit-equality. Float64 → 1e-12, Float32 → ~1e-6.

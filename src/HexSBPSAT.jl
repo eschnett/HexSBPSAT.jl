@@ -4,7 +4,7 @@
 SBP-SAT spectral-element operators on conforming hex meshes, sitting on
 top of `HexMeshes` for topology and parametric maps. Equation-agnostic:
 the only public PDE building blocks are the discrete Laplacian
-`apply_laplacian3d!` and its diagnostics. Wave-equation-specific code
+`apply_laplacian!` and its diagnostics. Wave-equation-specific code
 (`Params3d`, initial conditions, Sommerfeld BC, `recommended_dt`) lives
 downstream in `WaveToySecondOrder`.
 
@@ -22,7 +22,7 @@ downstream in `WaveToySecondOrder`.
                             device migration via `to_device`, and the
                             `Adapt.adapt_structure` rules used by KA at
                             launch time.
-* `kernels3d.jl`         — `apply_laplacian3d!`, the two `@kernel`s
+* `kernels3d.jl`         — `apply_laplacian!`, the two `@kernel`s
                             behind it (face-trace gather + volume work
                             + face SAT + mass division), and the
                             diagnostics built on top of it
@@ -33,22 +33,26 @@ downstream in `WaveToySecondOrder`.
 module HexSBPSAT
 
 using Adapt
-using FastGaussQuadrature
 using HexMeshes
 using HexMeshes: Mesh, MeshConnectivity, PatchDesc, PatchKind,
                  Cubic, Wedge, Inflation, Shell,
+                 make_uniform_quad, make_cubed_square_mesh, make_inflated_square_mesh,
                  make_uniform_hex, make_cubed_cube_mesh, make_inflated_cube_mesh,
                  nv, npatches, element_vertices, locate_point, invert_element_map,
                  interpolate_field,
+                 bilinear_shape, bilinear_dshape,
+                 bilinear_map, bilinear_jacobian,
                  trilinear_shape, trilinear_dshape,
                  trilinear_map, trilinear_jacobian,
                  lagrange_basis, tensor_interp
 # `_patch_point_and_jac` is internal to `HexMeshes` but is needed by
 # `make_geometry` to evaluate the analytic Jacobian on the curvilinear
-# patches; `_neigh_pq` is also internal but is read by
-# `kernels3d.jl::_face_sat_compute!` to walk the D₄ orientation
-# transform across an interior face. Pull both in explicitly.
-using HexMeshes: _patch_point_and_jac, _neigh_pq
+# patches; `_neigh_pq` / `_neigh_p` are also internal but are read by
+# `kernels3d.jl::_face_sat_compute!` / `kernels2d.jl::_face_sat_compute_2d!`
+# to walk the orientation transform across an interior face. Pull them
+# in explicitly.
+using HexMeshes: _patch_point_and_jac, _patch_point_and_jac_2d,
+                 _neigh_p, _neigh_pq
 using KernelAbstractions
 using KrylovKit
 using LinearAlgebra
@@ -60,20 +64,26 @@ include("operators.jl")
 include("kernels1d.jl")
 include("geometry.jl")
 include("kernels3d.jl")
+include("kernels2d.jl")
 
 export
     # Reference element + 1D operators
     make_element, make_domain, make_operators, SBPOps,
-    # 1D Laplacian (per-element + global) and diagnostic assembler
-    apply_laplacian!, build_global_laplacian,
-    # 3D operator-aware geometry
+    # Per-element / 1D-global Laplacian + diagnostic assembler
+    build_global_laplacian,
+    # Operator-aware geometry (dimension-generic in `D ∈ {2, 3}`) +
+    # the per-call scratch workspace that goes with it.
     MeshGeometry, make_geometry, element_coords,
+    MeshWorkspace, make_workspace,
     # Device migration
     to_device,
-    # 3D Laplacian + diagnostics
-    apply_laplacian3d!,
+    # Dimension-generic Laplacian + diagnostics. `apply_laplacian!`
+    # dispatches on `MeshGeometry{D, T, N}` (D = 2 or 3) for the
+    # curvilinear path, and on `AbstractVector` / `AbstractMatrix` for
+    # the 1D per-element / 1D-global paths in `kernels1d.jl`.
+    apply_laplacian!,
     discrete_laplacian,
-    spectral_radius_estimate,
+    spectral_radius_estimate, eigsolve_default_tol,
     discrete_inner_product, discrete_l2_norm,
     physical_mass_diagonal
 

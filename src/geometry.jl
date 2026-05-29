@@ -11,87 +11,145 @@
 # `HexSBPSAT.jl`).
 
 """
-    MeshGeometry{T, N}
+    MeshGeometry{D, T, N}
 
-Per-node geometric data for a `HexMesh`, evaluated at the GLL collocation
-points of a 1D reference element with `N` nodes. Holds *only* what the
-kernel reads — the underlying `HexMesh` topology (vertices and their
-indices into the connectivity) is **not** carried here; keep your own
-reference to it for host-side queries (`element_vertices`, plotting,
-`locate_point`, etc.).
+Per-node geometric data for a `Mesh{D}`, evaluated at the GLL collocation
+points of a 1D reference element with `N` nodes. Holds *only* read-only
+geometry — kernel scratch buffers live separately in [`MeshWorkspace`].
+The underlying `Mesh` topology (vertices and their indices into the
+connectivity) is **not** carried here; keep your own reference to it for
+host-side queries (`element_vertices`, plotting, `locate_point`, …).
+
+`D ∈ {2, 3}` is the spatial dimension. `D = 1` is reserved for the 1D
+operator path in `kernels1d.jl`, which doesn't need a `MeshGeometry`.
 
 # Fields
 
-* `Ne :: Int` — element count. Mirrors `mesh.Ne` of the originating
-  `HexMesh` and is used as the kernel `ndrange`.
-* `conn :: MeshConnectivity{MI, MI8}` — the four connectivity matrices
-  copied across from `mesh.conn`. Kernel-resident; backed by `Array`
-  on the host and by the appropriate device array on GPU backends.
-* `coords :: Array{T, 5}` of shape `(3, N, N, N, Ne)` — physical (x, y, z)
-  coordinate of every collocation point.
-* `jac    :: Array{T, 6}` of shape `(3, 3, N, N, N, Ne)` — Jacobian
-  matrix `J[a, b] = ∂xₐ / ∂ξ_b` of the element map at each node.
-* `invjac :: Array{T, 6}` — inverse of `J` at each node; supplies
-  `∂ξ / ∂x` to operators that need to pull physical gradients back to the
-  reference cube.
-* `detjac :: Array{T, 4}` of shape `(N, N, N, Ne)` — absolute value of
-  `det J`, the per-node volume factor used by the integration weights.
-* `Hphys :: Array{T, 4}` of shape `(N, N, N, Ne)` — the per-node
-  physical mass `H_ref[i]·H_ref[j]·H_ref[k]·|det J|`. Precomputed
-  here so that GPU-portable reductions (`discrete_inner_product`,
+* `Ne :: Int` — element count. Mirrors `mesh.Ne` and serves as the
+  outer kernel `ndrange` factor.
+* `conn :: MeshConnectivity{D}` — the four connectivity matrices copied
+  across from `mesh.conn`. Kernel-resident; backed by `Array` on the
+  host and by the appropriate device array on GPU backends.
+
+The remaining fields are D-shaped arrays whose ndim depends on `D`:
+
+| field        | dtype | D = 3 shape           | D = 2 shape      |
+| ------------ | ----- | --------------------- | ---------------- |
+| `coords`     | T     | (3, N, N, N, Ne)      | (2, N, N, Ne)    |
+| `jac`        | T     | (3, 3, N, N, N, Ne)   | (2, 2, N, N, Ne) |
+| `invjac`     | T     | (3, 3, N, N, N, Ne)   | (2, 2, N, N, Ne) |
+| `detjac`     | T     | (N, N, N, Ne)         | (N, N, Ne)       |
+| `Hphys`      | T     | (N, N, N, Ne)         | (N, N, Ne)       |
+| `handedness` | Int8  | (Ne,)                 | (Ne,)            |
+
+* `coords[a, …, e]` — physical-space coordinate `a ∈ 1..D` of every
+  collocation point.
+* `jac[a, b, …, e]` — Jacobian `J[a, b] = ∂xₐ / ∂ξ_b` of the element
+  map at each node.
+* `invjac[a, b, …, e]` — `J⁻¹[a, b] = ∂ξₐ / ∂x_b`, used to pull
+  physical gradients back to the reference cube/square.
+* `detjac[…, e]` — `|det J|`, the per-node volume factor.
+* `Hphys[…, e]` — the per-node physical mass
+  `(Πᵢ H_ref[…]) · |det J|`. Precomputed at `make_geometry` so that
+  GPU-portable reductions (`discrete_inner_product`,
   `discrete_l2_norm`, `spectral_radius_estimate`) can run as a single
-  `mapreduce` over device arrays without re-deriving the mass per
-  node from the 1D quadrature weights and the Jacobian on each call.
-* `face_trace :: Array{T, 5}` of shape `(4, N, N, 6, Ne)` — per-
-  element face-trace staging buffer used by the two-pass `rhs3d!`
-  implementation. Filled by pass 1 with `(u, ∂x u, ∂y u, ∂z u)` at
-  each face quadrature node (physical gradient — the local element's
-  `J⁻ᵀ` has already been applied), then read by pass 2 across the
-  neighbour relation `mesh.conn.neighbour` to compute the face SAT
-  contributions. This is workspace, not geometry: its values are
-  overwritten on every `rhs3d!` call. Hard-coded for V=1 fields
-  (the wave equation); supporting multi-component PDEs in the future
-  will replace the leading `4` with `4·V` or grow a sixth axis.
-* `handedness :: Vector{Int8}` of length `Ne` — `±1`, the sign of
-  `det J` on element `e`. A non-degenerate hex has uniform-sign Jacobian
-  throughout, so a single scalar per element captures the handedness;
-  `_add_face_sat!` reads this to pick the outward face normal direction
-  without a per-face-node test.
+  `mapreduce` over device arrays.
+* `handedness[e]` — `±1`, the sign of `det J` on element `e`. A non-
+  degenerate hex/quad has uniform-sign Jacobian throughout, so a
+  single scalar per element captures the handedness; the face-SAT
+  helper reads this to pick the outward normal direction without a
+  per-face-node test.
 
 The curvilinear-Laplacian kernel composes these with the 1D quadrature
 weights from `ops.H` on the fly: per-node physical mass is
-`Hphys = H_ref[i] H_ref[j] H_ref[k] · |det J|` and the weak-form stiffness
-kernel is `Wmetric = Hphys · (J⁻¹ J⁻ᵀ)`.
+`Hphys = (Πᵢ H_ref[…]) · |det J|` and the weak-form stiffness kernel is
+`Wmetric = Hphys · (J⁻¹ J⁻ᵀ)`.
 """
-# `MeshGeometry{T, N}` is parametrised on the concrete storage types of
-# every kernel-read field so it can be device-resident on any backend.
-# All fields are bitstype-adaptable, so KA's launch-time recursive
-# `adapt` migrates everything to device types in one shot — there is no
-# special handling of any host-only field, because there is none.
-struct MeshGeometry{T, N, MC, A5, A6, A4, V1}
+# `MeshGeometry{D, T, N, …}` is parametrised on the concrete storage
+# types of every kernel-read field so it can be device-resident on any
+# backend. `AF`/`AJ`/`AS`/`VH` are the field-, jacobian-, scalar-, and
+# handedness-array types — abbreviated to keep the inferred type
+# signature readable in stack traces.
+struct MeshGeometry{D, T, N, MC, AF, AJ, AS, VH}
     Ne         :: Int
     conn       :: MC
-    coords     :: A5
-    jac        :: A6
-    invjac     :: A6
-    detjac     :: A4
-    Hphys      :: A4
-    face_trace :: A5
-    handedness :: V1
+    coords     :: AF
+    jac        :: AJ
+    invjac     :: AJ
+    detjac     :: AS
+    Hphys      :: AS
+    handedness :: VH
 
-    function MeshGeometry{T, N}(Ne::Int, conn::MC,
-                                coords::A5, jac::A6, invjac::A6,
-                                detjac::A4, Hphys::A4,
-                                face_trace::A5,
-                                handedness::V1) where {T, N, MC, A5, A6, A4, V1}
-        new{T, N, MC, A5, A6, A4, V1}(Ne, conn,
-                                       coords, jac, invjac,
-                                       detjac, Hphys, face_trace, handedness)
+    function MeshGeometry{D, T, N}(Ne::Int, conn::MC,
+                                   coords::AF, jac::AJ, invjac::AJ,
+                                   detjac::AS, Hphys::AS,
+                                   handedness::VH) where {D, T, N, MC, AF, AJ, AS, VH}
+        new{D, T, N, MC, AF, AJ, AS, VH}(Ne, conn,
+                                          coords, jac, invjac,
+                                          detjac, Hphys, handedness)
     end
 end
 
 """
-    make_geometry(mesh, elem) → MeshGeometry{T, N}
+    MeshWorkspace{D, T, N}
+
+Per-element scratch buffers for the Laplacian kernels — values are
+overwritten on every operator call, so the workspace is genuinely
+write-only between calls. Pair one `MeshWorkspace` with each
+`MeshGeometry` you intend to launch the operator against.
+
+# Fields
+
+* `face_trace :: AF` — staging buffer used by the two-pass Laplacian
+  kernels. Filled by pass 1 with `(u, ∇u_phys)` at each face quadrature
+  node (the local element's `J⁻ᵀ` has already been applied), then read
+  by pass 2 across the neighbour relation `mesh.conn.neighbour` to
+  compute the face SAT contributions. Shape depends on `D`:
+
+  | D | shape               | channels                |
+  | - | ------------------- | ----------------------- |
+  | 3 | (4, N, N, 6, Ne)    | `(u, ∂xu, ∂yu, ∂zu)`    |
+  | 2 | (3, N, 4, Ne)       | `(u, ∂xu, ∂yu)`         |
+
+  Downstream BC kernels (e.g. WaveToySecondOrder's Sommerfeld pass)
+  read `work.face_trace` directly after `apply_laplacian!` has
+  populated it.
+
+Allocate one via [`make_workspace(geom)`](@ref). Multiple workspaces
+against the same geometry let independent operator calls run without
+sharing scratch — useful for matrix-free Jacobian-vector products and
+for keeping a separate workspace per ODE-solver stage.
+"""
+struct MeshWorkspace{D, T, N, AF}
+    face_trace :: AF
+
+    function MeshWorkspace{D, T, N}(face_trace::AF) where {D, T, N, AF}
+        new{D, T, N, AF}(face_trace)
+    end
+end
+
+"""
+    make_workspace(geom::MeshGeometry{D, T, N}) → MeshWorkspace{D, T, N}
+
+Allocate a fresh `MeshWorkspace` matching `geom`'s backend, element
+count, and polynomial order. The buffer's element type is `T` and its
+shape depends on `D` — see [`MeshWorkspace`](@ref).
+"""
+function make_workspace(geom::MeshGeometry{3, T, N}) where {T, N}
+    backend = KernelAbstractions.get_backend(geom.coords)
+    ft = KernelAbstractions.allocate(backend, T, 4, N, N, 6, geom.Ne)
+    return MeshWorkspace{3, T, N}(ft)
+end
+
+function make_workspace(geom::MeshGeometry{2, T, N}) where {T, N}
+    backend = KernelAbstractions.get_backend(geom.coords)
+    ft = KernelAbstractions.allocate(backend, T, 3, N, 4, geom.Ne)
+    return MeshWorkspace{2, T, N}(ft)
+end
+
+
+"""
+    make_geometry(mesh::Mesh{3, T}, elem) → MeshGeometry{3, T, N}
 
 Evaluate the trilinear element map of every hex in `mesh` at the GLL
 collocation points of the reference element `elem` (using `elem.xs ∈
@@ -118,7 +176,6 @@ function make_geometry(mesh::Mesh{3, T}, elem) where {T}
     invjac     = Array{T, 6}(undef, 3, 3, N, N, N, Ne)
     detjac     = Array{T, 4}(undef, N, N, N, Ne)
     Hphys      = Array{T, 4}(undef, N, N, N, Ne)
-    face_trace = Array{T, 5}(undef, 4, N, N, 6, Ne)   # workspace, see struct doc
     handedness = Vector{Int8}(undef, Ne)
 
     @inbounds for e in 1:Ne
@@ -167,8 +224,8 @@ function make_geometry(mesh::Mesh{3, T}, elem) where {T}
             end
         end
     end
-    return MeshGeometry{T, N}(Ne, mesh.conn,
-                              coords, jac, invjac, detjac, Hphys, face_trace, handedness)
+    return MeshGeometry{3, T, N}(Ne, mesh.conn,
+                                 coords, jac, invjac, detjac, Hphys, handedness)
 end
 
 ################################################################################
@@ -212,31 +269,40 @@ function to_device(mesh::Mesh{3, T}, backend) where {T}
                       patch_element_offset  = mesh.patch_element_offset)
 end
 
-function to_device(geom::MeshGeometry{T, N}, backend) where {T, N}
+function to_device(geom::MeshGeometry{D, T, N}, backend) where {D, T, N}
     conn_dev = to_device(geom.conn, backend)
     coords  = KernelAbstractions.allocate(backend, T,    size(geom.coords))
     jac     = KernelAbstractions.allocate(backend, T,    size(geom.jac))
     invjac  = KernelAbstractions.allocate(backend, T,    size(geom.invjac))
     detjac  = KernelAbstractions.allocate(backend, T,    size(geom.detjac))
     Hphys   = KernelAbstractions.allocate(backend, T,    size(geom.Hphys))
-    ft      = KernelAbstractions.allocate(backend, T,    size(geom.face_trace))
     hand    = KernelAbstractions.allocate(backend, Int8, size(geom.handedness))
     copyto!(coords, geom.coords)
     copyto!(jac,    geom.jac)
     copyto!(invjac, geom.invjac)
     copyto!(detjac, geom.detjac)
     copyto!(Hphys,  geom.Hphys)
-    # face_trace is workspace; no host data to copy. Its values are
-    # overwritten on every `rhs3d!` call. We still allocate it on the
-    # device so the kernels can write into it directly.
     copyto!(hand,   geom.handedness)
-    return MeshGeometry{T, N}(geom.Ne, conn_dev,
-                              coords, jac, invjac, detjac, Hphys, ft, hand)
+    return MeshGeometry{D, T, N}(geom.Ne, conn_dev,
+                                 coords, jac, invjac, detjac, Hphys, hand)
+end
+
+"""
+    to_device(work::MeshWorkspace{D, T, N}, backend) → MeshWorkspace{D, T, N}
+
+Allocate a fresh device-resident workspace matching `work`'s shape.
+The contents are scratch — no host-to-device copy is performed.
+"""
+function to_device(work::MeshWorkspace{D, T, N}, backend) where {D, T, N}
+    ft = KernelAbstractions.allocate(backend, T, size(work.face_trace))
+    return MeshWorkspace{D, T, N}(ft)
 end
 
 # `MeshConnectivity` device migration — used both directly (when a
-# caller migrates a HexMesh) and indirectly through `to_device(geom)`.
-function to_device(conn::MeshConnectivity, backend)
+# caller migrates a Mesh) and indirectly through `to_device(geom)`.
+# Preserves the spatial-dimension parameter `D` so 2D and 3D meshes
+# round-trip correctly.
+function to_device(conn::MeshConnectivity{D}, backend) where {D}
     nb  = KernelAbstractions.allocate(backend, Int32, size(conn.neighbour))
     nbf = KernelAbstractions.allocate(backend, Int8, size(conn.neighbour_face))
     ori = KernelAbstractions.allocate(backend, Int8, size(conn.orientation))
@@ -245,8 +311,7 @@ function to_device(conn::MeshConnectivity, backend)
     copyto!(nbf, conn.neighbour_face)
     copyto!(ori, conn.orientation)
     copyto!(bdr, conn.bdry)
-    # 3D-specific for now; HexSBPSAT generalization to D=1,2 is deferred.
-    return MeshConnectivity{3}(nb, nbf, ori, bdr)
+    return MeshConnectivity{D}(nb, nbf, ori, bdr)
 end
 
 # `Adapt.adapt_structure` rules. When KernelAbstractions launches a
@@ -265,8 +330,8 @@ Adapt.adapt_structure(to, c::MeshConnectivity{D}) where {D} = MeshConnectivity{D
     Adapt.adapt(to, c.orientation),
     Adapt.adapt(to, c.bdry))
 
-Adapt.adapt_structure(to, geom::MeshGeometry{T, N}) where {T, N} =
-    MeshGeometry{T, N}(
+Adapt.adapt_structure(to, geom::MeshGeometry{D, T, N}) where {D, T, N} =
+    MeshGeometry{D, T, N}(
         geom.Ne,
         Adapt.adapt(to, geom.conn),
         Adapt.adapt(to, geom.coords),
@@ -274,14 +339,118 @@ Adapt.adapt_structure(to, geom::MeshGeometry{T, N}) where {T, N} =
         Adapt.adapt(to, geom.invjac),
         Adapt.adapt(to, geom.detjac),
         Adapt.adapt(to, geom.Hphys),
-        Adapt.adapt(to, geom.face_trace),
         Adapt.adapt(to, geom.handedness))
 
+Adapt.adapt_structure(to, work::MeshWorkspace{D, T, N}) where {D, T, N} =
+    MeshWorkspace{D, T, N}(Adapt.adapt(to, work.face_trace))
+
 """
-    element_coords(mesh, elem) → Array{T, 5}
+    make_geometry(mesh::Mesh{2, T}, elem) → MeshGeometry
+
+2D analog of [`make_geometry(::Mesh{3}, elem)`](@ref). Returns a
+`MeshGeometry` whose arrays are 2D-shaped:
+
+* `coords     :: Array{T, 4}` of shape `(2, N, N, Ne)`
+* `jac        :: Array{T, 5}` of shape `(2, 2, N, N, Ne)`
+* `invjac     :: Array{T, 5}` of shape `(2, 2, N, N, Ne)`
+* `detjac     :: Array{T, 3}` of shape `(N, N, Ne)`
+* `Hphys      :: Array{T, 3}` of shape `(N, N, Ne)`
+* `handedness :: Vector{Int8}` of length `Ne`.
+
+Bilinear (`Cubic` / `Wedge` patches) and analytic
+(`Inflation` / `Shell`) paths exactly mirror the 3D structure. The
+scratch face-trace buffer lives in a separate [`MeshWorkspace`].
+"""
+function make_geometry(mesh::Mesh{2, T}, elem) where {T}
+    N  = elem.N
+    ξs = elem.xs
+    Ne = mesh.Ne
+
+    ops_ref = make_operators(elem)
+    H_1d    = SVector{N, T}(ntuple(i -> ops_ref.H[i, i], Val(N)))
+
+    coords     = Array{T, 4}(undef, 2, N, N, Ne)
+    jac        = Array{T, 5}(undef, 2, 2, N, N, Ne)
+    invjac     = Array{T, 5}(undef, 2, 2, N, N, Ne)
+    detjac     = Array{T, 3}(undef, N, N, Ne)
+    Hphys      = Array{T, 3}(undef, N, N, Ne)
+    handedness = Vector{Int8}(undef, Ne)
+
+    @inbounds for e in 1:Ne
+        pd = mesh.patch_desc[mesh.patch_id[e]]
+        if pd.kind === Cubic || pd.kind === Wedge
+            verts = element_vertices(mesh, e)
+            J_c   = bilinear_jacobian(verts, zero(T), zero(T))
+            handedness[e] = det(J_c) ≥ 0 ? Int8(1) : Int8(-1)
+            for j in 1:N, i in 1:N
+                ξ, η = ξs[i], ξs[j]
+                p  = bilinear_map(verts, ξ, η)
+                J  = bilinear_jacobian(verts, ξ, η)
+                Ji = inv(J)
+                dJ = abs(det(J))
+                for a in 1:2
+                    coords[a, i, j, e] = p[a]
+                    for b in 1:2
+                        jac[a, b, i, j, e]    = J[a, b]
+                        invjac[a, b, i, j, e] = Ji[a, b]
+                    end
+                end
+                detjac[i, j, e] = dJ
+                Hphys[i, j, e]  = H_1d[i] * H_1d[j] * dJ
+            end
+        else
+            idx = ntuple(d -> Int(mesh.patch_idx[d, e]), Val(2))
+            _, J_c = _patch_point_and_jac_2d(pd, idx, T(0.5), T(0.5))
+            handedness[e] = det(J_c) ≥ 0 ? Int8(1) : Int8(-1)
+            for j in 1:N, i in 1:N
+                ξ, η = ξs[i], ξs[j]
+                p, J = _patch_point_and_jac_2d(pd, idx, ξ, η)
+                Ji = inv(J)
+                dJ = abs(det(J))
+                for a in 1:2
+                    coords[a, i, j, e] = p[a]
+                    for b in 1:2
+                        jac[a, b, i, j, e]    = J[a, b]
+                        invjac[a, b, i, j, e] = Ji[a, b]
+                    end
+                end
+                detjac[i, j, e] = dJ
+                Hphys[i, j, e]  = H_1d[i] * H_1d[j] * dJ
+            end
+        end
+    end
+    return MeshGeometry{2, T, N}(Ne, mesh.conn,
+                                 coords, jac, invjac, detjac, Hphys, handedness)
+end
+
+"""
+    to_device(mesh::Mesh{2, T}, backend) → Mesh{2, T}
+
+2D analog of [`to_device(::Mesh{3}, backend)`](@ref).
+"""
+function to_device(mesh::Mesh{2, T}, backend) where {T}
+    nb  = KernelAbstractions.allocate(backend, Int32, size(mesh.conn.neighbour))
+    nbf = KernelAbstractions.allocate(backend, Int8, size(mesh.conn.neighbour_face))
+    ori = KernelAbstractions.allocate(backend, Int8, size(mesh.conn.orientation))
+    bdr = KernelAbstractions.allocate(backend, Int8, size(mesh.conn.bdry))
+    copyto!(nb,  mesh.conn.neighbour)
+    copyto!(nbf, mesh.conn.neighbour_face)
+    copyto!(ori, mesh.conn.orientation)
+    copyto!(bdr, mesh.conn.bdry)
+    new_conn = MeshConnectivity{2}(nb, nbf, ori, bdr)
+    return Mesh{2, T}(mesh.Ne, new_conn, mesh.vertex_coords, mesh.vertex_idx;
+                      patch_id              = mesh.patch_id,
+                      patch_idx             = mesh.patch_idx,
+                      patch_desc            = mesh.patch_desc,
+                      patch_element_offset  = mesh.patch_element_offset)
+end
+
+"""
+    element_coords(mesh, elem) → Array{T, …}
 
 Thin wrapper that returns just the physical collocation coordinates from
-`make_geometry(mesh, elem)`. Prefer `make_geometry` when you also need the
-per-node Jacobian.
+`make_geometry(mesh, elem)`. For `Mesh{3}` returns a `(3, N, N, N, Ne)`
+array; for `Mesh{2}` a `(2, N, N, Ne)` array.
 """
 element_coords(mesh::Mesh{3}, elem) = make_geometry(mesh, elem).coords
+element_coords(mesh::Mesh{2}, elem) = make_geometry(mesh, elem).coords

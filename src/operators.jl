@@ -2,6 +2,61 @@
 # SAT increment primitive (`_sat_increment`) used by both the 1D and 3D
 # kernels.
 
+"""
+    _supports_lobatto_native(::Type{T}) → Bool
+
+Compile-time trait controlling whether `PolynomialBases.LobattoLegendre(N - 1, T)`
+can be built directly for `T`, or whether [`_gll_basis`](@ref) should
+fall back to building in `Float64` and converting. The default is
+`true` — most `Real` types that support standard arithmetic and `cos`
+work natively. Override to `false` for known-broken types via a
+specialisation that the compiler can constant-fold (so the dispatch
+on `_gll_basis` collapses to one branch).
+
+# Known-broken types
+
+* `MultiFloats.MultiFloat{T, N}` (Float32x2, Float64x2, …):
+  `cos(::MultiFloat)` is defined but its body throws an "instructive
+  error" asking the user to opt into BigFloat-backed transcendentals.
+  Overridden to `false` by the package extension
+  `HexSBPSATMultiFloatsExt`; once MultiFloats ships a working `cos`,
+  the test `MultiFloats: cos(::MultiFloat) is still broken` (in
+  `test/test_precision.jl`) will fail and the extension can be
+  deleted.
+
+Users adding a new precision whose LobattoLegendre path is broken
+should override directly:
+
+    HexSBPSAT._supports_lobatto_native(::Type{MyFloat}) = false
+"""
+@inline _supports_lobatto_native(::Type{<:Real}) = true
+
+"""
+    _gll_basis(N::Int, ::Type{T})
+
+Gauss–Lobatto–Legendre basis on `[-1, 1]` of polynomial degree `N - 1`,
+exposed as a value with `.nodes`, `.weights`, `.D` fields.
+
+* If [`_supports_lobatto_native(T)`](@ref) is `true`, returns the
+  native `PolynomialBases.LobattoLegendre(N - 1, T)`.
+* Otherwise, builds in `Float64` and converts the three field arrays
+  to `T`. The operator entries inherit Float64 accuracy (~1.5e-8),
+  which is well below typical SBP truncation error.
+
+`Rational` precisions follow a separate Vandermonde construction (not
+via this helper) — see `_make_operators`.
+"""
+function _gll_basis(N::Int, ::Type{T}) where {T<:AbstractFloat}
+    if _supports_lobatto_native(T)
+        return LobattoLegendre(N - 1, T)
+    else
+        f64 = LobattoLegendre(N - 1, Float64)
+        return (nodes   = T.(f64.nodes),
+                weights = T.(f64.weights),
+                D       = T.(f64.D))
+    end
+end
+
 # Operator container with N as a compile-time parameter. The H/Hinv slot
 # is parameterised on `Hmat` so the GLL branch can store an `SDiagonal`
 # (truly diagonal — `H` is the GLL quadrature weights) while the Rational
@@ -33,10 +88,10 @@ function make_element(::Type{T}, N::Int) where {T}
         xs = x0 .+ h * ns
     else
         # Gauss-Lobatto-Legendre collocation points (better-conditioned SBP
-        # operators than equispaced). `gausslobatto` returns nodes on [-1,1];
+        # operators than equispaced). `_gll_basis` returns nodes on [-1,1];
         # map them linearly to [x0, x1].
-        ξ, _ = gausslobatto(N)
-        xs = T.((ξ .+ 1) ./ 2) .* (x1 - x0) .+ x0
+        ξ = _gll_basis(N, T).nodes
+        xs = ((ξ .+ one(T)) ./ T(2)) .* (x1 - x0) .+ x0
         # GLL points cluster near the endpoints; the minimum spacing sets
         # the effective CFL length scale.
         h = minimum(diff(xs))
@@ -99,14 +154,13 @@ function _make_operators(::Val{N}, dom) where {N}
         @assert all(D * xs.^0 .== 0)
         @assert all(D * xs.^p == p * xs.^(p-1) for p in 1:N-1)
     else
-        # GLL spectral-collocation operators via PolynomialBases.jl —
-        # numerically stable for any N. The basis is defined on [−1, 1];
-        # we map to [x0, x1] via the Jacobian dx/dξ = (x1−x0)/2.
-        basis = LobattoLegendre(N - 1, T)
+        # GLL spectral-collocation operators via `_gll_basis`. The basis
+        # is defined on [−1, 1]; map to [x0, x1] via Jacobian dx/dξ = (x1−x0)/2.
+        basis = _gll_basis(N, T)
         jac   = (x1 - x0) / T(2)
-        G = basis.D ./ jac                # ∂/∂x = (1/jac) · ∂/∂ξ
-        H = Diagonal(basis.weights .* jac) # ∫·dx = jac · ∫·dξ
-        D = G                              # diagonal-norm GLL collocation: D = G
+        G = basis.D ./ jac                  # ∂/∂x = (1/jac) · ∂/∂ξ
+        H = Diagonal(basis.weights .* jac)  # ∫·dx = jac · ∫·dξ
+        D = G                               # diagonal-norm GLL collocation: D = G
     end
 
     # Laplacian (without boundary conditions)
