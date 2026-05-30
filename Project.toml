@@ -1,6 +1,6 @@
 name = "HexSBPSAT"
 uuid = "62471009-8046-4323-9523-38e3c9f4e550"
-version = "0.1.0"
+version = "1.0.0"
 authors = ["Erik Schnetter <schnetter@gmail.com>"]
 
 [deps]
