@@ -50,17 +50,47 @@ end
 # Boundary data `bL`, `bR` are scalars (outer Dirichlet values). The
 # function name overloads the per-element kernel above on `AbstractMatrix`
 # vs `AbstractVector`.
+#
+# Two implementations:
+#
+#   * CPU (`u isa Array`): SVector-based per-element loop. Fully
+#     unrolled `SMatrix · SVector` algebra with no heap activity —
+#     fastest CPU path.
+#   * Non-CPU (Metal / CUDA / ROCm): KA kernel below
+#     (`_laplacian1d_matrix_kernel!`), workgroup-per-element with N
+#     workitems per workgroup. Each workitem computes one row of `L_h
+#     · u` plus its share of the per-endpoint SAT lift.
 
-function apply_laplacian!(Lu::AbstractMatrix, u::AbstractMatrix, bL, bR;
-                          dom, ops::SBPOps{N,T}, τ) where {N, T}
+using KernelAbstractions: @kernel, @index, @Const,
+                          get_backend, synchronize
+
+function apply_laplacian!(Lu::AbstractMatrix{T}, u::AbstractMatrix{T}, bL, bR;
+                          dom, ops::SBPOps{N, T}, τ) where {N, T}
     M = size(Lu, 2)
     @assert size(u, 2) == M
+
+    backend = get_backend(u)
+    if backend isa KernelAbstractions.CPU
+        return _apply_laplacian_1d_cpu!(Lu, u, T(bL), T(bR);
+                                         dom, ops, τ = T(τ))
+    end
+
+    # Non-CPU backend: launch the KA kernel. Workgroup-per-element,
+    # one workitem per local GLL node.
+    inv_h2 = one(T) / T(dom.h)^2
+    _laplacian1d_matrix_kernel!(backend, N)(
+        Lu, u, ops, T(τ), T(bL), T(bR), inv_h2, Val(N);
+        ndrange = N * M)
+    return Lu
+end
+
+@inline function _apply_laplacian_1d_cpu!(Lu::AbstractMatrix{T},
+                                           u::AbstractMatrix{T},
+                                           bL::T, bR::T;
+                                           dom, ops::SBPOps{N, T}, τ) where {N, T}
+    M = size(Lu, 2)
     half = one(T) / 2
 
-    # Each iteration loads its own column and the boundary slices of the
-    # immediate neighbours into stack-allocated SVectors. All per-element
-    # arithmetic is then `SMatrix · SVector` / `SVector` algebra — fully
-    # unrolled by the compiler with no heap activity.
     @inbounds for m in 1:M
         u_self = SVector{N}(view(u, :, m))
 
@@ -100,6 +130,102 @@ function apply_laplacian!(Lu::AbstractMatrix, u::AbstractMatrix, bL, bR;
 
     Lu .*= inv(dom.h^2)
     return Lu
+end
+
+# KA kernel — workgroup-per-element, N workitems each. Mirrors the
+# CPU code's per-element flow but expressed in scalar form (each
+# workitem computes one node of the per-element output). Loads `u_self`
+# into shared memory so the volume L·u_self stencil and the boundary-
+# trace gradients read from the workgroup-local copy instead of global
+# memory.
+#
+# Uses the dense `Hinv[i, 1]` / `Hinv[i, N]` accessor in the SAT
+# increment so the kernel works regardless of whether `Hinv` is stored
+# as `Diagonal` (GLL branch) or `SMatrix` (Rational branch). For the
+# Diagonal case this means 2·(N−1) zero mul-adds per workitem, which
+# is negligible vs the memory-bound cost of the rest.
+@kernel function _laplacian1d_matrix_kernel!(Lu::AbstractMatrix{T},
+                                              @Const(u::AbstractMatrix{T}),
+                                              ops, τ::T, bL::T, bR::T,
+                                              inv_h2::T,
+                                              ::Val{N}) where {T, N}
+    m  = @index(Group, Linear)
+    li = @index(Local, Linear)
+    i  = li
+    M  = size(u, 2)
+
+    u_loc = @localmem T (N,)
+    @inbounds u_loc[i] = u[i, m]
+    @synchronize
+
+    m  = @index(Group, Linear)
+    li = @index(Local, Linear)
+    i  = li
+
+    half = T(1) / T(2)
+
+    @inbounds u_self_1 = u_loc[1]
+    @inbounds u_self_N = u_loc[N]
+
+    # Endpoint gradients of `u_self`. Each workitem computes redundantly;
+    # the result is broadcast across the workgroup, so we save one
+    # @synchronize at the cost of two extra dot products per workitem.
+    GuL_self = zero(T); GuR_self = zero(T)
+    @inbounds for l in 1:N
+        GuL_self += ops.G[1, l] * u_loc[l]
+        GuR_self += ops.G[N, l] * u_loc[l]
+    end
+
+    # Left face SAT.
+    if m == 1
+        ΔuL  = u_self_1 - bL
+        ΔGuL = zero(T)
+        αL   = one(T)
+    else
+        @inbounds ΔuL = u_self_1 - u[N, m-1]
+        GuL_left = zero(T)
+        @inbounds for l in 1:N
+            GuL_left += ops.G[N, l] * u[l, m-1]
+        end
+        ΔGuL = GuL_self - GuL_left
+        αL = half
+    end
+
+    # Right face SAT.
+    if m == M
+        ΔuR  = u_self_N - bR
+        ΔGuR = zero(T)
+        αR   = one(T)
+    else
+        @inbounds ΔuR = u_self_N - u[1, m+1]
+        GuR_right = zero(T)
+        @inbounds for l in 1:N
+            GuR_right += ops.G[1, l] * u[l, m+1]
+        end
+        ΔGuR = GuR_self - GuR_right
+        αR = half
+    end
+
+    # Volume term: row `i` of `L · u_self`.
+    s = zero(T)
+    @inbounds for l in 1:N
+        s += ops.L[i, l] * u_loc[l]
+    end
+
+    # Boundary-correction coefficients (shared across nodes in this
+    # workgroup, computed redundantly to keep the per-workitem path
+    # straight-line).
+    cL = -αL * ΔuL
+    cR =  αR * ΔuR
+    b1 =  half * ΔGuL - τ * ΔuL
+    bN = -half * ΔGuR - τ * ΔuR
+
+    # SAT increment at node `i`. Dense Hinv form (correct for both
+    # Diagonal and full-SMatrix Hinv).
+    @inbounds inc = cL * ops.HinvG_L[i] + cR * ops.HinvG_R[i] +
+                    b1 * ops.Hinv[i, 1] + bN * ops.Hinv[i, N]
+
+    @inbounds Lu[i, m] = (s + inc) * inv_h2
 end
 
 ################################################################################

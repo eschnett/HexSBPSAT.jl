@@ -35,7 +35,3 @@ The kernel-resident arrays in `MeshGeometry` and `MeshConnectivity`
 adapt under KernelAbstractions' launch-time `Adapt.adapt`. Package
 extensions `HexSBPSATCUDAExt` and `HexSBPSATMetalExt` wire in the
 CUDA.jl / Metal.jl backends when those packages are loaded.
-
-## License
-
-MIT.

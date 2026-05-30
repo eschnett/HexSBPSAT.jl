@@ -27,7 +27,7 @@ HexSBPSATMultiFloatsExt = "MultiFloats"
 [compat]
 Adapt = "4"
 CUDA = "6"
-HexMeshes = "0.1"
+HexMeshes = "1.0.0"
 KernelAbstractions = "0.9"
 KrylovKit = "0.10.3"
 LinearAlgebra = "1.10.0"
