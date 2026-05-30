@@ -9,6 +9,9 @@ contains a Laplacian (wave, heat, Schrödinger, …); the wave-equation
 driver lives downstream in
 [WaveToySecondOrder.jl](https://github.com/eschnetter/WaveToySecondOrder.jl).
 
+[![CI](https://github.com/eschnett/HexSBPSAT.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/eschnett/HexSBPSAT.jl/actions/workflows/CI.yml)
+[![Documentation](https://github.com/eschnett/HexSBPSAT.jl/actions/workflows/docs.yml/badge.svg)](https://eschnett.github.io/HexSBPSAT.jl/)
+
 ## What's here
 
 | Concept | Type / function | Notes |
