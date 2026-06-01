@@ -180,10 +180,11 @@ function make_geometry(mesh::Mesh{3, T}, elem) where {T}
 
     @inbounds for e in 1:Ne
         pd  = mesh.patch_desc[mesh.patch_id[e]]
-        # Trilinear path for `Cubic` and `Wedge`; analytic
-        # (`_patch_point_and_jac`) for `Inflation`, `Shell`, and
-        # `WarpedCubic`.
-        if pd.kind === Cubic || pd.kind === Wedge
+        # Trilinear path for `Cubic` only (the cubic map is linear so
+        # trilinear is exact). Analytic `_patch_point_and_jac` for the
+        # non-linear maps: `Inflation`, `Shell`, `WarpedCubic`, and
+        # `Wedge` (added 2026-06).
+        if pd.kind === Cubic
             verts = element_vertices(mesh, e)
             J_c   = trilinear_jacobian(verts, zero(T), zero(T), zero(T))
             handedness[e] = det(J_c) ≥ 0 ? Int8(1) : Int8(-1)
@@ -379,7 +380,7 @@ function make_geometry(mesh::Mesh{2, T}, elem) where {T}
 
     @inbounds for e in 1:Ne
         pd = mesh.patch_desc[mesh.patch_id[e]]
-        if pd.kind === Cubic || pd.kind === Wedge
+        if pd.kind === Cubic
             verts = element_vertices(mesh, e)
             J_c   = bilinear_jacobian(verts, zero(T), zero(T))
             handedness[e] = det(J_c) ≥ 0 ? Int8(1) : Int8(-1)
