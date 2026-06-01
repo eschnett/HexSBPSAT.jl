@@ -33,14 +33,15 @@ operator path in `kernels1d.jl`, which doesn't need a `MeshGeometry`.
 
 The remaining fields are D-shaped arrays whose ndim depends on `D`:
 
-| field        | dtype | D = 3 shape           | D = 2 shape      |
-| ------------ | ----- | --------------------- | ---------------- |
-| `coords`     | T     | (3, N, N, N, Ne)      | (2, N, N, Ne)    |
-| `jac`        | T     | (3, 3, N, N, N, Ne)   | (2, 2, N, N, Ne) |
-| `invjac`     | T     | (3, 3, N, N, N, Ne)   | (2, 2, N, N, Ne) |
-| `detjac`     | T     | (N, N, N, Ne)         | (N, N, Ne)       |
-| `Hphys`      | T     | (N, N, N, Ne)         | (N, N, Ne)       |
-| `handedness` | Int8  | (Ne,)                 | (Ne,)            |
+| field        | dtype | D = 3 shape              | D = 2 shape         |
+| ------------ | ----- | ------------------------ | ------------------- |
+| `coords`     | T     | (3, N, N, N, Ne)         | (2, N, N, Ne)       |
+| `jac`        | T     | (3, 3, N, N, N, Ne)      | (2, 2, N, N, Ne)    |
+| `invjac`     | T     | (3, 3, N, N, N, Ne)      | (2, 2, N, N, Ne)    |
+| `dinvjac`    | T     | (3, 3, 3, N, N, N, Ne)   | (2, 2, 2, N, N, Ne) |
+| `detjac`     | T     | (N, N, N, Ne)            | (N, N, Ne)          |
+| `Hphys`      | T     | (N, N, N, Ne)            | (N, N, Ne)          |
+| `handedness` | Int8  | (Ne,)                    | (Ne,)               |
 
 * `coords[a, …, e]` — physical-space coordinate `a ∈ 1..D` of every
   collocation point.
@@ -48,6 +49,11 @@ The remaining fields are D-shaped arrays whose ndim depends on `D`:
   map at each node.
 * `invjac[a, b, …, e]` — `J⁻¹[a, b] = ∂ξₐ / ∂x_b`, used to pull
   physical gradients back to the reference cube/square.
+* `dinvjac[α, a, b, …, e]` — `∂_b (invjac[α, a]) = ∂_{x_b} (∂ξ_α / ∂x_a)`,
+  the physical-coordinate derivative of the inverse Jacobian. Used by
+  the GH chain rule to convert reference second derivatives to physical
+  mixed partials (the scalar code only needs the trace of this, packed
+  into `W^β`; multi-component sources like GH need the full tensor).
 * `detjac[…, e]` — `|det J|`, the per-node volume factor.
 * `Hphys[…, e]` — the per-node physical mass
   `(Πᵢ H_ref[…]) · |det J|`. Precomputed at `make_geometry` so that
@@ -70,23 +76,25 @@ weights from `ops.H` on the fly: per-node physical mass is
 # backend. `AF`/`AJ`/`AS`/`VH` are the field-, jacobian-, scalar-, and
 # handedness-array types — abbreviated to keep the inferred type
 # signature readable in stack traces.
-struct MeshGeometry{D, T, N, MC, AF, AJ, AS, VH}
+struct MeshGeometry{D, T, N, MC, AF, AJ, AD, AS, VH}
     Ne         :: Int
     conn       :: MC
     coords     :: AF
     jac        :: AJ
     invjac     :: AJ
+    dinvjac    :: AD
     detjac     :: AS
     Hphys      :: AS
     handedness :: VH
 
     function MeshGeometry{D, T, N}(Ne::Int, conn::MC,
                                    coords::AF, jac::AJ, invjac::AJ,
+                                   dinvjac::AD,
                                    detjac::AS, Hphys::AS,
-                                   handedness::VH) where {D, T, N, MC, AF, AJ, AS, VH}
-        new{D, T, N, MC, AF, AJ, AS, VH}(Ne, conn,
-                                          coords, jac, invjac,
-                                          detjac, Hphys, handedness)
+                                   handedness::VH) where {D, T, N, MC, AF, AJ, AD, AS, VH}
+        new{D, T, N, MC, AF, AJ, AD, AS, VH}(Ne, conn,
+                                              coords, jac, invjac, dinvjac,
+                                              detjac, Hphys, handedness)
     end
 end
 
@@ -170,10 +178,12 @@ function make_geometry(mesh::Mesh{3, T}, elem) where {T}
     # is `O(N²)` and runs once at mesh setup, so the cost is invisible.
     ops_ref = make_operators(elem)
     H_1d    = SVector{N, T}(ntuple(i -> ops_ref.H[i, i], Val(N)))
+    G_ref   = ops_ref.G
 
     coords     = Array{T, 5}(undef, 3, N, N, N, Ne)
     jac        = Array{T, 6}(undef, 3, 3, N, N, N, Ne)
     invjac     = Array{T, 6}(undef, 3, 3, N, N, N, Ne)
+    dinvjac    = Array{T, 7}(undef, 3, 3, 3, N, N, N, Ne)
     detjac     = Array{T, 4}(undef, N, N, N, Ne)
     Hphys      = Array{T, 4}(undef, N, N, N, Ne)
     handedness = Vector{Int8}(undef, Ne)
@@ -226,8 +236,34 @@ function make_geometry(mesh::Mesh{3, T}, elem) where {T}
             end
         end
     end
+
+    # Populate dinvjac[α, a, b, i, j, k, e] = ∂_b (invjac[α, a]).
+    # Reference-axis SBP-G derivatives of invjac, then pull back to
+    # physical coordinates via invjac itself:
+    #   D̂_c (J⁻¹)[α, a]      = (G_ref · invjac[α, a, ·])  along axis c
+    #   ∂_b (J⁻¹)[α, a]      = (J⁻¹)[c, b] · D̂_c (J⁻¹)[α, a]
+    @inbounds for e in 1:Ne
+        for k in 1:N, j in 1:N, i in 1:N
+            for α in 1:3, a in 1:3
+                d1 = zero(T); d2 = zero(T); d3 = zero(T)
+                for p in 1:N
+                    d1 += G_ref[i, p] * invjac[α, a, p, j, k, e]
+                    d2 += G_ref[j, p] * invjac[α, a, i, p, k, e]
+                    d3 += G_ref[k, p] * invjac[α, a, i, j, p, e]
+                end
+                for b in 1:3
+                    dinvjac[α, a, b, i, j, k, e] =
+                        invjac[1, b, i, j, k, e] * d1 +
+                        invjac[2, b, i, j, k, e] * d2 +
+                        invjac[3, b, i, j, k, e] * d3
+                end
+            end
+        end
+    end
+
     return MeshGeometry{3, T, N}(Ne, mesh.conn,
-                                 coords, jac, invjac, detjac, Hphys, handedness)
+                                 coords, jac, invjac, dinvjac,
+                                 detjac, Hphys, handedness)
 end
 
 ################################################################################
@@ -276,17 +312,20 @@ function to_device(geom::MeshGeometry{D, T, N}, backend) where {D, T, N}
     coords  = KernelAbstractions.allocate(backend, T,    size(geom.coords))
     jac     = KernelAbstractions.allocate(backend, T,    size(geom.jac))
     invjac  = KernelAbstractions.allocate(backend, T,    size(geom.invjac))
+    dinvjac = KernelAbstractions.allocate(backend, T,    size(geom.dinvjac))
     detjac  = KernelAbstractions.allocate(backend, T,    size(geom.detjac))
     Hphys   = KernelAbstractions.allocate(backend, T,    size(geom.Hphys))
     hand    = KernelAbstractions.allocate(backend, Int8, size(geom.handedness))
-    copyto!(coords, geom.coords)
-    copyto!(jac,    geom.jac)
-    copyto!(invjac, geom.invjac)
-    copyto!(detjac, geom.detjac)
-    copyto!(Hphys,  geom.Hphys)
-    copyto!(hand,   geom.handedness)
+    copyto!(coords,  geom.coords)
+    copyto!(jac,     geom.jac)
+    copyto!(invjac,  geom.invjac)
+    copyto!(dinvjac, geom.dinvjac)
+    copyto!(detjac,  geom.detjac)
+    copyto!(Hphys,   geom.Hphys)
+    copyto!(hand,    geom.handedness)
     return MeshGeometry{D, T, N}(geom.Ne, conn_dev,
-                                 coords, jac, invjac, detjac, Hphys, hand)
+                                 coords, jac, invjac, dinvjac,
+                                 detjac, Hphys, hand)
 end
 
 """
@@ -339,6 +378,7 @@ Adapt.adapt_structure(to, geom::MeshGeometry{D, T, N}) where {D, T, N} =
         Adapt.adapt(to, geom.coords),
         Adapt.adapt(to, geom.jac),
         Adapt.adapt(to, geom.invjac),
+        Adapt.adapt(to, geom.dinvjac),
         Adapt.adapt(to, geom.detjac),
         Adapt.adapt(to, geom.Hphys),
         Adapt.adapt(to, geom.handedness))
@@ -370,10 +410,12 @@ function make_geometry(mesh::Mesh{2, T}, elem) where {T}
 
     ops_ref = make_operators(elem)
     H_1d    = SVector{N, T}(ntuple(i -> ops_ref.H[i, i], Val(N)))
+    G_ref   = ops_ref.G
 
     coords     = Array{T, 4}(undef, 2, N, N, Ne)
     jac        = Array{T, 5}(undef, 2, 2, N, N, Ne)
     invjac     = Array{T, 5}(undef, 2, 2, N, N, Ne)
+    dinvjac    = Array{T, 6}(undef, 2, 2, 2, N, N, Ne)
     detjac     = Array{T, 3}(undef, N, N, Ne)
     Hphys      = Array{T, 3}(undef, N, N, Ne)
     handedness = Vector{Int8}(undef, Ne)
@@ -421,8 +463,28 @@ function make_geometry(mesh::Mesh{2, T}, elem) where {T}
             end
         end
     end
+    # Populate dinvjac[α, a, b, i, j, e] = ∂_b (invjac[α, a]) — 2D analog
+    # of the 3D loop above; see that comment block for the chain rule.
+    @inbounds for e in 1:Ne
+        for j in 1:N, i in 1:N
+            for α in 1:2, a in 1:2
+                d1 = zero(T); d2 = zero(T)
+                for p in 1:N
+                    d1 += G_ref[i, p] * invjac[α, a, p, j, e]
+                    d2 += G_ref[j, p] * invjac[α, a, i, p, e]
+                end
+                for b in 1:2
+                    dinvjac[α, a, b, i, j, e] =
+                        invjac[1, b, i, j, e] * d1 +
+                        invjac[2, b, i, j, e] * d2
+                end
+            end
+        end
+    end
+
     return MeshGeometry{2, T, N}(Ne, mesh.conn,
-                                 coords, jac, invjac, detjac, Hphys, handedness)
+                                 coords, jac, invjac, dinvjac,
+                                 detjac, Hphys, handedness)
 end
 
 """
