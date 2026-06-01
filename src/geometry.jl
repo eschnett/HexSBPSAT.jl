@@ -181,7 +181,8 @@ function make_geometry(mesh::Mesh{3, T}, elem) where {T}
     @inbounds for e in 1:Ne
         pd  = mesh.patch_desc[mesh.patch_id[e]]
         # Trilinear path for `Cubic` and `Wedge`; analytic
-        # (`_patch_point_and_jac`) for `Inflation` and `Shell`.
+        # (`_patch_point_and_jac`) for `Inflation`, `Shell`, and
+        # `WarpedCubic`.
         if pd.kind === Cubic || pd.kind === Wedge
             verts = element_vertices(mesh, e)
             J_c   = trilinear_jacobian(verts, zero(T), zero(T), zero(T))

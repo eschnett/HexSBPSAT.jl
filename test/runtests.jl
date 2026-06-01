@@ -37,4 +37,5 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
     _section("test_apply_laplacian3d.jl");  include("test_apply_laplacian3d.jl")
     _section("test_apply_laplacian2d.jl");  include("test_apply_laplacian2d.jl")
     _section("test_precision.jl");          include("test_precision.jl")
+    _section("test_periodic.jl");           include("test_periodic.jl")
 end

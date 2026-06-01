@@ -35,7 +35,7 @@ module HexSBPSAT
 using Adapt
 using HexMeshes
 using HexMeshes: Mesh, MeshConnectivity, PatchDesc, PatchKind,
-                 Cubic, Wedge, Inflation, Shell,
+                 Cubic, Wedge, Inflation, Shell, WarpedCubic,
                  make_uniform_quad, make_cubed_square_mesh, make_inflated_square_mesh,
                  make_uniform_hex, make_cubed_cube_mesh, make_inflated_cube_mesh,
                  nv, npatches, element_vertices, locate_point, invert_element_map,
