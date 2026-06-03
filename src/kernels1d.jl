@@ -229,6 +229,126 @@ end
 end
 
 ################################################################################
+# 1D first derivative with centred-flux SAT, driven by MeshConnectivity.
+#
+# ONE consistent `D` operator: reference SBP-G + centred-flux SAT at
+# every interior element interface. With the SAT coefficient
+# `1/(2 · Hphys_face)` the assembled operator `H · D` is exactly skew
+# (`H·D + (H·D)ᵀ = 0`) on a periodic mesh — the SBP property
+# `H·G = Q + ½(e_N e_Nᵀ − e_1 e_1ᵀ)` leaves `±½` diagonal boundary
+# terms per element, and the centred-flux SAT cancels exactly those
+# while coupling the neighbouring face values.
+#
+# Neighbour lookup goes through `geom.conn` (`neighbour`,
+# `neighbour_face`) rather than hardwired `m ± 1`, so the same code
+# serves uniform periodic lines and any future 1D mesh; this is also
+# the structure the 2D/3D gradient/divergence SATs will reuse, with
+# `orientation` transforms inserted at the lookup site.
+#
+# Faces with `bdry ≠ 0` (non-periodic outer boundaries) currently get
+# *no* SAT contribution — a one-sided derivative. Dirichlet/Sommerfeld
+# SAT variants hook in here in a later phase.
+
+"""
+    apply_D!(Du, u; geom::MeshGeometry{1, T, N}, ops::SBPOps{N, T}) → Du
+
+Apply the consistent first-derivative operator (reference SBP-G +
+centred-flux SAT at interior faces, neighbour relation from
+`geom.conn`) to the state matrix `u :: (N, Ne)`, writing the physical
+derivative into `Du`. Requires positively-oriented elements
+(`handedness == +1`).
+"""
+function apply_D!(Du::AbstractMatrix{T}, u::AbstractMatrix{T};
+                  geom::MeshGeometry{1, T, N}, ops::SBPOps{N, T}) where {N, T}
+    Ne = geom.Ne
+    @assert size(u) == size(Du) == (N, Ne)
+
+    backend = get_backend(u)
+    if backend isa KernelAbstractions.CPU
+        return _apply_D_1d_cpu!(Du, u, geom, ops)
+    end
+
+    _apply_D_1d_kernel!(backend, N)(
+        Du, u, ops, geom.conn.neighbour, geom.conn.bdry,
+        geom.invjac, geom.Hphys, Val(N);
+        ndrange = N * Ne)
+    return Du
+end
+
+@inline function _apply_D_1d_cpu!(Du::AbstractMatrix{T}, u::AbstractMatrix{T},
+                                  geom::MeshGeometry{1, T, N},
+                                  ops::SBPOps{N, T}) where {N, T}
+    Ne        = geom.Ne
+    neighbour = geom.conn.neighbour
+    bdry      = geom.conn.bdry
+    half      = one(T) / 2
+
+    @inbounds for m in 1:Ne
+        u_self = SVector{N}(view(u, :, m))
+        Gu = ops.G * u_self
+
+        # Volume term: physical derivative via the per-node inverse
+        # Jacobian (constant per element for affine line elements).
+        for i in 1:N
+            Du[i, m] = Gu[i] * geom.invjac[1, 1, i, m]
+        end
+
+        # Centred-flux SAT, coefficient 1/(2·Hphys_face). The 1D
+        # neighbour-face convention: an interior face always meets the
+        # *opposite* face of the neighbour, so the neighbour's trace
+        # node is N at our face 1 and 1 at our face 2.
+        if bdry[1, m] == 0
+            mL = Int(neighbour[1, m])
+            Du[1, m] += (u_self[1] - u[N, mL]) * half / geom.Hphys[1, m]
+        end
+        if bdry[2, m] == 0
+            mR = Int(neighbour[2, m])
+            Du[N, m] += (u[1, mR] - u_self[N]) * half / geom.Hphys[N, m]
+        end
+    end
+    return Du
+end
+
+# KA kernel — workgroup-per-element, N workitems each; mirrors the CPU
+# per-element flow in scalar form, with `u_self` staged through shared
+# memory (same structure as `_laplacian1d_matrix_kernel!`).
+@kernel function _apply_D_1d_kernel!(Du::AbstractMatrix{T},
+                                     @Const(u::AbstractMatrix{T}),
+                                     ops, @Const(neighbour), @Const(bdry),
+                                     @Const(invjac), @Const(Hphys),
+                                     ::Val{N}) where {T, N}
+    m = @index(Group, Linear)
+    i = @index(Local, Linear)
+
+    u_loc = @localmem T (N,)
+    @inbounds u_loc[i] = u[i, m]
+    @synchronize
+
+    m = @index(Group, Linear)
+    i = @index(Local, Linear)
+
+    half = T(1) / T(2)
+
+    s = zero(T)
+    @inbounds for l in 1:N
+        s += ops.G[i, l] * u_loc[l]
+    end
+    @inbounds s *= invjac[1, 1, i, m]
+
+    # Face SAT — only the two face workitems contribute.
+    @inbounds if i == 1 && bdry[1, m] == 0
+        mL = Int(neighbour[1, m])
+        s += (u_loc[1] - u[N, mL]) * half / Hphys[1, m]
+    end
+    @inbounds if i == N && bdry[2, m] == 0
+        mR = Int(neighbour[2, m])
+        s += (u[1, mR] - u_loc[N]) * half / Hphys[N, m]
+    end
+
+    @inbounds Du[i, m] = s
+end
+
+################################################################################
 # Diagnostic: assemble the global L_SAT matrix for `M` elements coupled
 # DG-style. Used by the test suite to verify symmetry / null-space /
 # spectrum properties; not on any simulation hot path.

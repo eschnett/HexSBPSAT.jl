@@ -4,7 +4,8 @@
 SBP-SAT spectral-element operators on conforming hex meshes, sitting on
 top of `HexMeshes` for topology and parametric maps. Equation-agnostic:
 the only public PDE building blocks are the discrete Laplacian
-`apply_laplacian!` and its diagnostics. Wave-equation-specific code
+`apply_laplacian!`, the 1D first-derivative operator `apply_D!`, and
+their diagnostics. Wave-equation-specific code
 (`Params3d`, initial conditions, Sommerfeld BC, `recommended_dt`) lives
 downstream in `WaveToySecondOrder`.
 
@@ -14,8 +15,10 @@ downstream in `WaveToySecondOrder`.
                             constructors, `make_operators`, and the
                             `_sat_increment` primitive shared between
                             the 1D and 3D kernels.
-* `kernels1d.jl`         — 1D `apply_laplacian!` (per-element + global)
-                            and the diagnostic `build_global_laplacian`.
+* `kernels1d.jl`         — 1D `apply_laplacian!` (per-element + global),
+                            the connectivity-driven first-derivative
+                            operator `apply_D!`, and the diagnostic
+                            `build_global_laplacian`.
 * `geometry.jl`          — `MeshGeometry`, `make_geometry` (dispatches
                             on per-element `PatchDesc.kind` to choose
                             trilinear vs analytic-Jacobian path),
@@ -40,6 +43,7 @@ using HexMeshes: Mesh, MeshConnectivity, PatchDesc, PatchKind,
                  make_uniform_hex, make_cubed_cube_mesh, make_inflated_cube_mesh,
                  nv, npatches, element_vertices, locate_point, invert_element_map,
                  interpolate_field,
+                 linear_map, linear_jacobian,
                  bilinear_shape, bilinear_dshape,
                  bilinear_map, bilinear_jacobian,
                  trilinear_shape, trilinear_dshape,
@@ -60,9 +64,11 @@ using PolynomialBases: LobattoLegendre
 using Random
 using StaticArrays
 
+# `geometry.jl` precedes `kernels1d.jl` because the connectivity-driven
+# 1D operator `apply_D!` dispatches on `MeshGeometry{1}`.
 include("operators.jl")
-include("kernels1d.jl")
 include("geometry.jl")
+include("kernels1d.jl")
 include("kernels3d.jl")
 include("kernels2d.jl")
 
@@ -71,6 +77,8 @@ export
     make_element, make_domain, make_operators, SBPOps,
     # Per-element / 1D-global Laplacian + diagnostic assembler
     build_global_laplacian,
+    # Connectivity-driven 1D first derivative (SBP-G + centred-flux SAT)
+    apply_D!,
     # Operator-aware geometry (dimension-generic in `D ∈ {2, 3}`) +
     # the per-call scratch workspace that goes with it.
     MeshGeometry, make_geometry, element_coords,

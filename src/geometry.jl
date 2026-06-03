@@ -20,8 +20,11 @@ The underlying `Mesh` topology (vertices and their indices into the
 connectivity) is **not** carried here; keep your own reference to it for
 host-side queries (`element_vertices`, plotting, `locate_point`, …).
 
-`D ∈ {2, 3}` is the spatial dimension. `D = 1` is reserved for the 1D
-operator path in `kernels1d.jl`, which doesn't need a `MeshGeometry`.
+`D ∈ {1, 2, 3}` is the spatial dimension. The legacy 1D Laplacian path
+in `kernels1d.jl` (`apply_laplacian!` on `(N, M)` matrices) predates
+`MeshGeometry{1}` and still works off a plain `make_domain` NamedTuple;
+the connectivity-driven first-derivative operator `apply_D!` uses
+`MeshGeometry{1}`.
 
 # Fields
 
@@ -33,15 +36,15 @@ operator path in `kernels1d.jl`, which doesn't need a `MeshGeometry`.
 
 The remaining fields are D-shaped arrays whose ndim depends on `D`:
 
-| field        | dtype | D = 3 shape              | D = 2 shape         |
-| ------------ | ----- | ------------------------ | ------------------- |
-| `coords`     | T     | (3, N, N, N, Ne)         | (2, N, N, Ne)       |
-| `jac`        | T     | (3, 3, N, N, N, Ne)      | (2, 2, N, N, Ne)    |
-| `invjac`     | T     | (3, 3, N, N, N, Ne)      | (2, 2, N, N, Ne)    |
-| `dinvjac`    | T     | (3, 3, 3, N, N, N, Ne)   | (2, 2, 2, N, N, Ne) |
-| `detjac`     | T     | (N, N, N, Ne)            | (N, N, Ne)          |
-| `Hphys`      | T     | (N, N, N, Ne)            | (N, N, Ne)          |
-| `handedness` | Int8  | (Ne,)                    | (Ne,)               |
+| field        | dtype | D = 3 shape              | D = 2 shape         | D = 1 shape      |
+| ------------ | ----- | ------------------------ | ------------------- | ---------------- |
+| `coords`     | T     | (3, N, N, N, Ne)         | (2, N, N, Ne)       | (1, N, Ne)       |
+| `jac`        | T     | (3, 3, N, N, N, Ne)      | (2, 2, N, N, Ne)    | (1, 1, N, Ne)    |
+| `invjac`     | T     | (3, 3, N, N, N, Ne)      | (2, 2, N, N, Ne)    | (1, 1, N, Ne)    |
+| `dinvjac`    | T     | (3, 3, 3, N, N, N, Ne)   | (2, 2, 2, N, N, Ne) | (1, 1, 1, N, Ne) |
+| `detjac`     | T     | (N, N, N, Ne)            | (N, N, Ne)          | (N, Ne)          |
+| `Hphys`      | T     | (N, N, N, Ne)            | (N, N, Ne)          | (N, Ne)          |
+| `handedness` | Int8  | (Ne,)                    | (Ne,)               | (Ne,)            |
 
 * `coords[a, …, e]` — physical-space coordinate `a ∈ 1..D` of every
   collocation point.
@@ -510,11 +513,95 @@ function to_device(mesh::Mesh{2, T}, backend) where {T}
 end
 
 """
+    make_geometry(mesh::Mesh{1, T}, elem) → MeshGeometry{1, T, N}
+
+1D analog of [`make_geometry(::Mesh{3}, elem)`](@ref). Returns a
+`MeshGeometry` whose arrays are 1D-shaped:
+
+* `coords     :: Array{T, 3}` of shape `(1, N, Ne)`
+* `jac        :: Array{T, 4}` of shape `(1, 1, N, Ne)`
+* `invjac     :: Array{T, 4}` of shape `(1, 1, N, Ne)`
+* `dinvjac    :: Array{T, 5}` of shape `(1, 1, 1, N, Ne)`
+* `detjac     :: Array{T, 2}` of shape `(N, Ne)`
+* `Hphys      :: Array{T, 2}` of shape `(N, Ne)`
+* `handedness :: Vector{Int8}` of length `Ne`.
+
+Line elements are affine (`linear_map`), so `jac` is constant per
+element (`J = x_R − x_L`, the element width for a positively-oriented
+element) and `dinvjac` is identically zero — both are kept per-node
+for API uniformity with the curvilinear 2D/3D paths.
+"""
+function make_geometry(mesh::Mesh{1, T}, elem) where {T}
+    N  = elem.N
+    ξs = elem.xs
+    Ne = mesh.Ne
+
+    ops_ref = make_operators(elem)
+    H_1d    = SVector{N, T}(ntuple(i -> ops_ref.H[i, i], Val(N)))
+
+    coords     = Array{T, 3}(undef, 1, N, Ne)
+    jac        = Array{T, 4}(undef, 1, 1, N, Ne)
+    invjac     = Array{T, 4}(undef, 1, 1, N, Ne)
+    dinvjac    = zeros(T, 1, 1, 1, N, Ne)
+    detjac     = Array{T, 2}(undef, N, Ne)
+    Hphys      = Array{T, 2}(undef, N, Ne)
+    handedness = Vector{Int8}(undef, Ne)
+
+    @inbounds for e in 1:Ne
+        verts = element_vertices(mesh, e)
+        J_c   = linear_jacobian(verts, zero(T))
+        handedness[e] = det(J_c) ≥ 0 ? Int8(1) : Int8(-1)
+        for i in 1:N
+            ξ  = ξs[i]
+            p  = linear_map(verts, ξ)
+            J  = linear_jacobian(verts, ξ)
+            Ji = inv(J)
+            dJ = abs(det(J))
+            coords[1, i, e]    = p[1]
+            jac[1, 1, i, e]    = J[1, 1]
+            invjac[1, 1, i, e] = Ji[1, 1]
+            detjac[i, e]       = dJ
+            Hphys[i, e]        = H_1d[i] * dJ
+        end
+    end
+
+    return MeshGeometry{1, T, N}(Ne, mesh.conn,
+                                 coords, jac, invjac, dinvjac,
+                                 detjac, Hphys, handedness)
+end
+
+function make_workspace(geom::MeshGeometry{1, T, N}) where {T, N}
+    backend = KernelAbstractions.get_backend(geom.coords)
+    # Channels (u, Du) × 2 faces per element — kept for API uniformity
+    # with the 2D/3D face-trace layout; the connectivity-driven
+    # `apply_D!` reads neighbour face values directly from the global
+    # state and does not use this buffer.
+    ft = KernelAbstractions.allocate(backend, T, 2, 2, geom.Ne)
+    return MeshWorkspace{1, T, N}(ft)
+end
+
+"""
+    to_device(mesh::Mesh{1, T}, backend) → Mesh{1, T}
+
+1D analog of [`to_device(::Mesh{3}, backend)`](@ref).
+"""
+function to_device(mesh::Mesh{1, T}, backend) where {T}
+    new_conn = to_device(mesh.conn, backend)
+    return Mesh{1, T}(mesh.Ne, new_conn, mesh.vertex_coords, mesh.vertex_idx;
+                      patch_id              = mesh.patch_id,
+                      patch_idx             = mesh.patch_idx,
+                      patch_desc            = mesh.patch_desc,
+                      patch_element_offset  = mesh.patch_element_offset)
+end
+
+"""
     element_coords(mesh, elem) → Array{T, …}
 
 Thin wrapper that returns just the physical collocation coordinates from
 `make_geometry(mesh, elem)`. For `Mesh{3}` returns a `(3, N, N, N, Ne)`
-array; for `Mesh{2}` a `(2, N, N, Ne)` array.
+array; for `Mesh{2}` a `(2, N, N, Ne)` array; for `Mesh{1}` a
+`(1, N, Ne)` array.
 """
 element_coords(mesh::Mesh{3}, elem) = make_geometry(mesh, elem).coords
 element_coords(mesh::Mesh{2}, elem) = make_geometry(mesh, elem).coords
+element_coords(mesh::Mesh{1}, elem) = make_geometry(mesh, elem).coords
