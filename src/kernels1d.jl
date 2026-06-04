@@ -51,15 +51,14 @@ end
 # function name overloads the per-element kernel above on `AbstractMatrix`
 # vs `AbstractVector`.
 #
-# Two implementations:
-#
-#   * CPU (`u isa Array`): SVector-based per-element loop. Fully
-#     unrolled `SMatrix · SVector` algebra with no heap activity —
-#     fastest CPU path.
-#   * Non-CPU (Metal / CUDA / ROCm): KA kernel below
-#     (`_laplacian1d_matrix_kernel!`), workgroup-per-element with N
-#     workitems per workgroup. Each workitem computes one row of `L_h
-#     · u` plus its share of the per-endpoint SAT lift.
+# A SINGLE KernelAbstractions kernel (`_laplacian1d_matrix_kernel!`)
+# runs on both CPU and GPU — workgroup-per-element, one workitem per
+# local GLL node, `u_self` staged through shared memory. The CPU
+# backend executes it serially (used to test the GPU path; highest CPU
+# efficiency is not a goal). This is a uniform line with `m ± 1`
+# interior coupling and outer Dirichlet `bL, bR`; the regular neighbour
+# access is read directly from global `u`, so no separate gather pass is
+# needed (unlike the orientation-bearing 2D operators).
 
 using KernelAbstractions: @kernel, @index, @Const,
                           get_backend, synchronize
@@ -68,15 +67,7 @@ function apply_laplacian!(Lu::AbstractMatrix{T}, u::AbstractMatrix{T}, bL, bR;
                           dom, ops::SBPOps{N, T}, τ) where {N, T}
     M = size(Lu, 2)
     @assert size(u, 2) == M
-
     backend = get_backend(u)
-    if backend isa KernelAbstractions.CPU
-        return _apply_laplacian_1d_cpu!(Lu, u, T(bL), T(bR);
-                                         dom, ops, τ = T(τ))
-    end
-
-    # Non-CPU backend: launch the KA kernel. Workgroup-per-element,
-    # one workitem per local GLL node.
     inv_h2 = one(T) / T(dom.h)^2
     _laplacian1d_matrix_kernel!(backend, N)(
         Lu, u, ops, T(τ), T(bL), T(bR), inv_h2, Val(N);
@@ -84,60 +75,10 @@ function apply_laplacian!(Lu::AbstractMatrix{T}, u::AbstractMatrix{T}, bL, bR;
     return Lu
 end
 
-@inline function _apply_laplacian_1d_cpu!(Lu::AbstractMatrix{T},
-                                           u::AbstractMatrix{T},
-                                           bL::T, bR::T;
-                                           dom, ops::SBPOps{N, T}, τ) where {N, T}
-    M = size(Lu, 2)
-    half = one(T) / 2
-
-    @inbounds for m in 1:M
-        u_self = SVector{N}(view(u, :, m))
-
-        GuL_self = dot(ops.G[1, :], u_self)
-        GuR_self = dot(ops.G[N, :], u_self)
-
-        # Left face.
-        if m == 1
-            ΔuL  = u_self[1] - bL
-            ΔGuL = zero(T)
-            αL   = one(T)
-        else
-            u_left = SVector{N}(view(u, :, m-1))
-            ΔuL  = u_self[1] - u_left[N]
-            ΔGuL = GuL_self - dot(ops.G[N, :], u_left)
-            αL   = half
-        end
-
-        # Right face — symmetric.
-        if m == M
-            ΔuR  = u_self[N] - bR
-            ΔGuR = zero(T)
-            αR   = one(T)
-        else
-            u_right = SVector{N}(view(u, :, m+1))
-            ΔuR  = u_self[N] - u_right[1]
-            ΔGuR = GuR_self - dot(ops.G[1, :], u_right)
-            αR   = half
-        end
-
-        result = ops.L * u_self +
-                 _sat_increment(ΔuL, ΔuR, ΔGuL, ΔGuR, αL, αR, ops, τ)
-        for i in 1:N
-            Lu[i, m] = result[i]
-        end
-    end
-
-    Lu .*= inv(dom.h^2)
-    return Lu
-end
-
-# KA kernel — workgroup-per-element, N workitems each. Mirrors the
-# CPU code's per-element flow but expressed in scalar form (each
-# workitem computes one node of the per-element output). Loads `u_self`
-# into shared memory so the volume L·u_self stencil and the boundary-
-# trace gradients read from the workgroup-local copy instead of global
-# memory.
+# KA kernel — workgroup-per-element, N workitems each. Each workitem
+# computes one node of the per-element output. Loads `u_self` into
+# shared memory so the volume L·u_self stencil and the boundary-trace
+# gradients read from the workgroup-local copy instead of global memory.
 #
 # Uses the dense `Hinv[i, 1]` / `Hinv[i, N]` accessor in the SAT
 # increment so the kernel works regardless of whether `Hinv` is stored
@@ -262,12 +203,7 @@ function apply_D!(Du::AbstractMatrix{T}, u::AbstractMatrix{T};
                   geom::MeshGeometry{1, T, N}, ops::SBPOps{N, T}) where {N, T}
     Ne = geom.Ne
     @assert size(u) == size(Du) == (N, Ne)
-
     backend = get_backend(u)
-    if backend isa KernelAbstractions.CPU
-        return _apply_D_1d_cpu!(Du, u, geom, ops)
-    end
-
     _apply_D_1d_kernel!(backend, N)(
         Du, u, ops, geom.conn.neighbour, geom.conn.bdry,
         geom.invjac, geom.Hphys, Val(N);
@@ -275,43 +211,10 @@ function apply_D!(Du::AbstractMatrix{T}, u::AbstractMatrix{T};
     return Du
 end
 
-@inline function _apply_D_1d_cpu!(Du::AbstractMatrix{T}, u::AbstractMatrix{T},
-                                  geom::MeshGeometry{1, T, N},
-                                  ops::SBPOps{N, T}) where {N, T}
-    Ne        = geom.Ne
-    neighbour = geom.conn.neighbour
-    bdry      = geom.conn.bdry
-    half      = one(T) / 2
-
-    @inbounds for m in 1:Ne
-        u_self = SVector{N}(view(u, :, m))
-        Gu = ops.G * u_self
-
-        # Volume term: physical derivative via the per-node inverse
-        # Jacobian (constant per element for affine line elements).
-        for i in 1:N
-            Du[i, m] = Gu[i] * geom.invjac[1, 1, i, m]
-        end
-
-        # Centred-flux SAT, coefficient 1/(2·Hphys_face). The 1D
-        # neighbour-face convention: an interior face always meets the
-        # *opposite* face of the neighbour, so the neighbour's trace
-        # node is N at our face 1 and 1 at our face 2.
-        if bdry[1, m] == 0
-            mL = Int(neighbour[1, m])
-            Du[1, m] += (u_self[1] - u[N, mL]) * half / geom.Hphys[1, m]
-        end
-        if bdry[2, m] == 0
-            mR = Int(neighbour[2, m])
-            Du[N, m] += (u[1, mR] - u_self[N]) * half / geom.Hphys[N, m]
-        end
-    end
-    return Du
-end
-
-# KA kernel — workgroup-per-element, N workitems each; mirrors the CPU
-# per-element flow in scalar form, with `u_self` staged through shared
-# memory (same structure as `_laplacian1d_matrix_kernel!`).
+# A SINGLE KA kernel runs on both CPU and GPU — workgroup-per-element,
+# N workitems each, `u_self` staged through shared memory. 1D interior
+# faces meet the *opposite* face of the neighbour (regular access, read
+# from global `u`); no gather pass needed.
 @kernel function _apply_D_1d_kernel!(Du::AbstractMatrix{T},
                                      @Const(u::AbstractMatrix{T}),
                                      ops, @Const(neighbour), @Const(bdry),

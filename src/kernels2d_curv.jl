@@ -20,7 +20,22 @@
 # term equals the outward normal × surface element, so the jump of a
 # constant field (zero) and the GCL (zero metric divergence) together
 # give free-stream. `bdry ≠ 0` faces get no SAT (one-sided/excision;
-# BCs are layered downstream). CPU only for now.
+# BCs are layered downstream).
+#
+# Structure: a SINGLE set of KernelAbstractions kernels runs on both CPU
+# and GPU (the CPU backend executes them serially; it is used to test the
+# GPU path — highest CPU efficiency is not a goal). Each operator is
+# TWO passes, mirroring `apply_laplacian!`:
+#   1. gather  — every element writes its face-node field values into the
+#      workspace face trace `work.face_trace[ch, p, f, e]` (gradient: Φ in
+#      channel 1; divergence: F1, F2 in channels 1, 2);
+#   2. volume+SAT — workgroup-per-element, N² workitems; stage the field
+#      into `@localmem`, do the split-form volume reduction, then apply the
+#      centred-flux SAT by reading the NEIGHBOUR's gathered trace
+#      `work.face_trace[ch, pn, nbr_face, nbr]` (orientation via `_neigh_p`).
+#      Each output node is written by exactly one workitem (gather, not
+#      scatter) — no races. The two separate launches give the global
+#      barrier between gather and read.
 
 """
     make_metric_terms2d(geom::MeshGeometry{2,T,N}, ops) → NamedTuple
@@ -62,165 +77,58 @@ end
 @inline _facesign2d(f, ::Type{T}) where {T} = isodd(f) ? -one(T) : one(T)
 
 """
-    apply_gradient2d!(g1, g2, Φ; geom, ops, metric) → (g1, g2)
+    apply_gradient2d!(g1, g2, Φ; geom, ops, metric, work) → (g1, g2)
 
 Physical gradient `(∂_xΦ, ∂_yΦ)` of `Φ::(N,N,Ne)` on a curvilinear
 2D mesh, conservative free-stream-preserving form + centred-flux SAT.
+Two KernelAbstractions passes (gather → volume+SAT) that run on both
+CPU and GPU; `work::MeshWorkspace{2,T,N}` supplies the face-trace
+buffer (channel 1 holds Φ at face nodes).
 """
 function apply_gradient2d!(g1::AbstractArray{T,3}, g2::AbstractArray{T,3},
                            Φ::AbstractArray{T,3};
                            geom::MeshGeometry{2,T,N}, ops::SBPOps{N,T},
-                           metric) where {T,N}
+                           metric, work::MeshWorkspace{2,T,N}) where {T,N}
     backend = get_backend(Φ)
-    if backend isa KernelAbstractions.CPU
-        return _grad2d_cpu!(g1, g2, Φ, geom, ops, metric)
-    end
-    _grad2d_kernel!(backend, (N, N))(
-        g1, g2, Φ, ops, metric.ax1, metric.ax2, metric.ay1, metric.ay2,
+    _gather_face2d_1ch!(backend, (N, N))(
+        Φ, work, geom.conn.bdry, Val(N); ndrange = (N, N, geom.Ne))
+    _grad2d_volume_kernel!(backend, N^2)(
+        g1, g2, Φ, work, ops, metric.ax1, metric.ax2, metric.ay1, metric.ay2,
         metric.invdetJ, geom.conn.neighbour, geom.conn.neighbour_face,
         geom.conn.orientation, geom.conn.bdry, Val(N);
-        ndrange = (N, N, geom.Ne))
+        ndrange = N^2 * geom.Ne)
     return g1, g2
 end
 
-@inline function _grad2d_cpu!(g1::AbstractArray{T,3}, g2::AbstractArray{T,3},
-                              Φ::AbstractArray{T,3}, geom::MeshGeometry{2,T,N},
-                              ops::SBPOps{N,T}, metric) where {T,N}
-    Ne = geom.Ne; G = ops.G; conn = geom.conn
-    H1 = SVector{N,T}(ntuple(i -> ops.H[i, i], Val(N)))
-    (; ax1, ax2, ay1, ay2, invdetJ) = metric
-    half = one(T) / 2
-    @inbounds for e in 1:Ne
-        # Volume, SPLIT (skew-symmetric) form ½(conservative + advective):
-        #   conservative_a = Σ_α D̂_α(aₐ^α Φ)
-        #   advective_a    = Σ_α aₐ^α (D̂_α Φ)
-        for j in 1:N, i in 1:N
-            csx = zero(T); csy = zero(T); gξ = zero(T); gη = zero(T)
-            for p in 1:N
-                Gip = G[i, p]; Gjp = G[j, p]
-                csx += Gip * ax1[p,j,e] * Φ[p,j,e] + Gjp * ax2[i,p,e] * Φ[i,p,e]
-                csy += Gip * ay1[p,j,e] * Φ[p,j,e] + Gjp * ay2[i,p,e] * Φ[i,p,e]
-                gξ  += Gip * Φ[p,j,e]
-                gη  += Gjp * Φ[i,p,e]
-            end
-            adx = ax1[i,j,e]*gξ + ax2[i,j,e]*gη
-            ady = ay1[i,j,e]*gξ + ay2[i,j,e]*gη
-            g1[i,j,e] = half * (csx + adx) * invdetJ[i,j,e]
-            g2[i,j,e] = half * (csy + ady) * invdetJ[i,j,e]
-        end
-        # SAT: lift ½(Φ_nbr − Φ_self) via the self metric term.
-        for f in 1:4
-            conn.bdry[f, e] == 0 || continue
-            nbr = Int(conn.neighbour[f, e]); nf = Int(conn.neighbour_face[f, e])
-            o = Int(conn.orientation[f, e]); s_f = _facesign2d(f, T)
-            row = isodd(f) ? 1 : N
-            for p in 1:N
-                ci, cj = _facenode2d(f, p, Val(N))
-                pn = _neigh_p(o, p, N); ni, nj = _facenode2d(nf, pn, Val(N))
-                jump = Φ[ni,nj,nbr] - Φ[ci,cj,e]
-                nfx = s_f * (f ≤ 2 ? ax1[ci,cj,e] : ax2[ci,cj,e])
-                nfy = s_f * (f ≤ 2 ? ay1[ci,cj,e] : ay2[ci,cj,e])
-                c = invdetJ[ci,cj,e] * half * jump / H1[row]
-                g1[ci,cj,e] += c * nfx
-                g2[ci,cj,e] += c * nfy
-            end
-        end
-    end
-    return g1, g2
-end
-
-"""
-    apply_divergence2d!(divF, F1, F2; geom, ops, metric) → divF
-
-Physical divergence `∂_xF^x + ∂_yF^y` of the vector field
-`(F1, F2)::(N,N,Ne)` on a curvilinear 2D mesh — the SBP-adjoint of
-`apply_gradient2d!`, conservative form + centred-flux SAT.
-"""
-function apply_divergence2d!(divF::AbstractArray{T,3},
-                             F1::AbstractArray{T,3}, F2::AbstractArray{T,3};
-                             geom::MeshGeometry{2,T,N}, ops::SBPOps{N,T},
-                             metric) where {T,N}
-    backend = get_backend(divF)
-    if backend isa KernelAbstractions.CPU
-        return _div2d_cpu!(divF, F1, F2, geom, ops, metric)
-    end
-    _div2d_kernel!(backend, (N, N))(
-        divF, F1, F2, ops, metric.ax1, metric.ax2, metric.ay1, metric.ay2,
-        metric.invdetJ, geom.conn.neighbour, geom.conn.neighbour_face,
-        geom.conn.orientation, geom.conn.bdry, Val(N);
-        ndrange = (N, N, geom.Ne))
-    return divF
-end
-
-@inline function _div2d_cpu!(divF::AbstractArray{T,3},
-                             F1::AbstractArray{T,3}, F2::AbstractArray{T,3},
-                             geom::MeshGeometry{2,T,N}, ops::SBPOps{N,T},
-                             metric) where {T,N}
-    Ne = geom.Ne; G = ops.G; conn = geom.conn
-    H1 = SVector{N,T}(ntuple(i -> ops.H[i, i], Val(N)))
-    (; ax1, ax2, ay1, ay2, invdetJ) = metric
-    half = one(T) / 2
-    @inbounds for e in 1:Ne
-        # Volume, SPLIT form ½(conservative + advective):
-        #   conservative = Σ_α D̂_α(F̃^α),   F̃^α = Σ_a aₐ^α F^a
-        #   advective    = Σ_a Σ_α aₐ^α (D̂_α F^a)
-        for j in 1:N, i in 1:N
-            cs = zero(T)
-            gξF1 = zero(T); gηF1 = zero(T); gξF2 = zero(T); gηF2 = zero(T)
-            for p in 1:N
-                Gip = G[i,p]; Gjp = G[j,p]
-                Ft1 = ax1[p,j,e]*F1[p,j,e] + ay1[p,j,e]*F2[p,j,e]   # F̃^1 at (p,j)
-                Ft2 = ax2[i,p,e]*F1[i,p,e] + ay2[i,p,e]*F2[i,p,e]   # F̃^2 at (i,p)
-                cs += Gip*Ft1 + Gjp*Ft2
-                gξF1 += Gip*F1[p,j,e]; gηF1 += Gjp*F1[i,p,e]
-                gξF2 += Gip*F2[p,j,e]; gηF2 += Gjp*F2[i,p,e]
-            end
-            ad = ax1[i,j,e]*gξF1 + ax2[i,j,e]*gηF1 +
-                 ay1[i,j,e]*gξF2 + ay2[i,j,e]*gηF2
-            divF[i,j,e] = half * (cs + ad) * invdetJ[i,j,e]
-        end
-        # SAT: centred-flux of the physical normal flux (self metric).
-        for f in 1:4
-            conn.bdry[f, e] == 0 || continue
-            nbr = Int(conn.neighbour[f, e]); nf = Int(conn.neighbour_face[f, e])
-            o = Int(conn.orientation[f, e]); s_f = _facesign2d(f, T)
-            row = isodd(f) ? 1 : N
-            for p in 1:N
-                ci, cj = _facenode2d(f, p, Val(N))
-                pn = _neigh_p(o, p, N); ni, nj = _facenode2d(nf, pn, Val(N))
-                nfx = s_f * (f ≤ 2 ? ax1[ci,cj,e] : ax2[ci,cj,e])
-                nfy = s_f * (f ≤ 2 ? ay1[ci,cj,e] : ay2[ci,cj,e])
-                Fn_self = nfx*F1[ci,cj,e] + nfy*F2[ci,cj,e]
-                Fn_nbr  = nfx*F1[ni,nj,nbr] + nfy*F2[ni,nj,nbr]
-                divF[ci,cj,e] += invdetJ[ci,cj,e] * half * (Fn_nbr - Fn_self) / H1[row]
-            end
-        end
-    end
-    return divF
-end
-
-################################################################################
-# GPU kernels (KernelAbstractions). Workgroup-per-element, N² workitems;
-# each workitem (i, j) computes one node's output from global reads (no
-# shared-memory staging — correctness-first), then adds the centred-flux
-# SAT for any boundary face it lies on (a node touches ≤ 2 faces; each
-# workitem writes only its own node, so no atomics). Mirror the CPU
-# split-form volume + SAT exactly.
-
-@kernel function _grad2d_kernel!(g1, g2, @Const(Φ), ops,
-                                 @Const(ax1), @Const(ax2), @Const(ay1),
-                                 @Const(ay2), @Const(invdetJ),
-                                 @Const(neighbour), @Const(nbr_face),
-                                 @Const(orient), @Const(bdry),
-                                 ::Val{N}) where {N}
-    i, j, e = @index(Global, NTuple)
-    T = eltype(g1); G = ops.G; half = T(1) / 2
+# Pass 1 (gather) is the shared `_gather_face2d_1ch!` (Φ → channel 1),
+# defined in kernels2d_grad.jl.
+#
+# Pass 2: per element, stage Φ into `@localmem`, do the split-form volume
+# reduction, then apply the centred-flux SAT reading the neighbour's
+# gathered trace. One write per node (gather, no scatter).
+@kernel function _grad2d_volume_kernel!(g1::AbstractArray{T}, g2,
+                                        @Const(Φ), work, ops,
+                                        @Const(ax1), @Const(ax2), @Const(ay1),
+                                        @Const(ay2), @Const(invdetJ),
+                                        @Const(neighbour), @Const(nbr_face),
+                                        @Const(orient), @Const(bdry),
+                                        ::Val{N}) where {T, N}
+    e    = @index(Group, Linear)
+    li   = @index(Local, Linear)
+    i, j = _ij_from_li(li, Val(N))
+    u_loc = @localmem T (N, N)
+    @inbounds u_loc[i, j] = Φ[i, j, e]
+    @synchronize
+    e    = @index(Group, Linear)
+    li   = @index(Local, Linear)
+    i, j = _ij_from_li(li, Val(N))
+    G = ops.G; half = T(1) / 2
     csx = zero(T); csy = zero(T); gξ = zero(T); gη = zero(T)
     @inbounds for p in 1:N
         Gip = G[i, p]; Gjp = G[j, p]
-        csx += Gip*ax1[p,j,e]*Φ[p,j,e] + Gjp*ax2[i,p,e]*Φ[i,p,e]
-        csy += Gip*ay1[p,j,e]*Φ[p,j,e] + Gjp*ay2[i,p,e]*Φ[i,p,e]
-        gξ  += Gip*Φ[p,j,e]; gη += Gjp*Φ[i,p,e]
+        csx += Gip*ax1[p,j,e]*u_loc[p,j] + Gjp*ax2[i,p,e]*u_loc[i,p]
+        csy += Gip*ay1[p,j,e]*u_loc[p,j] + Gjp*ay2[i,p,e]*u_loc[i,p]
+        gξ  += Gip*u_loc[p,j]; gη += Gjp*u_loc[i,p]
     end
     @inbounds idJ = invdetJ[i,j,e]
     @inbounds r1 = half*(csx + ax1[i,j,e]*gξ + ax2[i,j,e]*gη)*idJ
@@ -233,8 +141,8 @@ end
         p_local = a_idx == 1 ? j : i
         nbr = Int(neighbour[f,e]); nf = Int(nbr_face[f,e]); o = Int(orient[f,e])
         s_f = isodd(f) ? -one(T) : one(T)
-        pn = _neigh_p(o, p_local, N); ni, nj = _facenode2d(nf, pn, Val(N))
-        jump = Φ[ni,nj,nbr] - Φ[i,j,e]
+        pn = _neigh_p(o, p_local, N)
+        jump = work.face_trace[1, pn, nf, nbr] - u_loc[i,j]
         nfx = s_f * (f ≤ 2 ? ax1[i,j,e] : ax2[i,j,e])
         nfy = s_f * (f ≤ 2 ? ay1[i,j,e] : ay2[i,j,e])
         c = idJ * half * jump / ops.H[row, row]
@@ -244,22 +152,61 @@ end
     @inbounds g2[i,j,e] = r2
 end
 
-@kernel function _div2d_kernel!(divF, @Const(F1), @Const(F2), ops,
-                                @Const(ax1), @Const(ax2), @Const(ay1),
-                                @Const(ay2), @Const(invdetJ),
-                                @Const(neighbour), @Const(nbr_face),
-                                @Const(orient), @Const(bdry),
-                                ::Val{N}) where {N}
-    i, j, e = @index(Global, NTuple)
-    T = eltype(divF); G = ops.G; half = T(1) / 2
+"""
+    apply_divergence2d!(divF, F1, F2; geom, ops, metric, work) → divF
+
+Physical divergence `∂_xF^x + ∂_yF^y` of the vector field
+`(F1, F2)::(N,N,Ne)` on a curvilinear 2D mesh — the SBP-adjoint of
+`apply_gradient2d!`, conservative form + centred-flux SAT. Two KA
+passes; `work.face_trace` channels 1, 2 hold F1, F2 at face nodes.
+"""
+function apply_divergence2d!(divF::AbstractArray{T,3},
+                             F1::AbstractArray{T,3}, F2::AbstractArray{T,3};
+                             geom::MeshGeometry{2,T,N}, ops::SBPOps{N,T},
+                             metric, work::MeshWorkspace{2,T,N}) where {T,N}
+    backend = get_backend(divF)
+    _gather_face2d_2ch!(backend, (N, N))(
+        F1, F2, work, geom.conn.bdry, Val(N); ndrange = (N, N, geom.Ne))
+    _div2d_volume_kernel!(backend, N^2)(
+        divF, F1, F2, work, ops, metric.ax1, metric.ax2, metric.ay1, metric.ay2,
+        metric.invdetJ, geom.conn.neighbour, geom.conn.neighbour_face,
+        geom.conn.orientation, geom.conn.bdry, Val(N);
+        ndrange = N^2 * geom.Ne)
+    return divF
+end
+
+# Pass 1 (gather) is the shared `_gather_face2d_2ch!` (F1, F2 → channels
+# 1, 2), defined in kernels2d_grad.jl.
+#
+# Pass 2: stage (F1, F2) into `@localmem`, split-form volume divergence,
+# then centred-flux SAT reading the neighbour's gathered (F1, F2).
+@kernel function _div2d_volume_kernel!(divF::AbstractArray{T},
+                                       @Const(F1), @Const(F2), work, ops,
+                                       @Const(ax1), @Const(ax2), @Const(ay1),
+                                       @Const(ay2), @Const(invdetJ),
+                                       @Const(neighbour), @Const(nbr_face),
+                                       @Const(orient), @Const(bdry),
+                                       ::Val{N}) where {T, N}
+    e    = @index(Group, Linear)
+    li   = @index(Local, Linear)
+    i, j = _ij_from_li(li, Val(N))
+    F1_loc = @localmem T (N, N)
+    F2_loc = @localmem T (N, N)
+    @inbounds F1_loc[i, j] = F1[i, j, e]
+    @inbounds F2_loc[i, j] = F2[i, j, e]
+    @synchronize
+    e    = @index(Group, Linear)
+    li   = @index(Local, Linear)
+    i, j = _ij_from_li(li, Val(N))
+    G = ops.G; half = T(1) / 2
     cs = zero(T); gξF1 = zero(T); gηF1 = zero(T); gξF2 = zero(T); gηF2 = zero(T)
     @inbounds for p in 1:N
         Gip = G[i,p]; Gjp = G[j,p]
-        Ft1 = ax1[p,j,e]*F1[p,j,e] + ay1[p,j,e]*F2[p,j,e]
-        Ft2 = ax2[i,p,e]*F1[i,p,e] + ay2[i,p,e]*F2[i,p,e]
+        Ft1 = ax1[p,j,e]*F1_loc[p,j] + ay1[p,j,e]*F2_loc[p,j]   # F̃^1 at (p,j)
+        Ft2 = ax2[i,p,e]*F1_loc[i,p] + ay2[i,p,e]*F2_loc[i,p]   # F̃^2 at (i,p)
         cs += Gip*Ft1 + Gjp*Ft2
-        gξF1 += Gip*F1[p,j,e]; gηF1 += Gjp*F1[i,p,e]
-        gξF2 += Gip*F2[p,j,e]; gηF2 += Gjp*F2[i,p,e]
+        gξF1 += Gip*F1_loc[p,j]; gηF1 += Gjp*F1_loc[i,p]
+        gξF2 += Gip*F2_loc[p,j]; gηF2 += Gjp*F2_loc[i,p]
     end
     @inbounds idJ = invdetJ[i,j,e]
     @inbounds ad = ax1[i,j,e]*gξF1 + ax2[i,j,e]*gηF1 +
@@ -273,11 +220,11 @@ end
         p_local = a_idx == 1 ? j : i
         nbr = Int(neighbour[f,e]); nf = Int(nbr_face[f,e]); o = Int(orient[f,e])
         s_f = isodd(f) ? -one(T) : one(T)
-        pn = _neigh_p(o, p_local, N); ni, nj = _facenode2d(nf, pn, Val(N))
+        pn = _neigh_p(o, p_local, N)
         nfx = s_f * (f ≤ 2 ? ax1[i,j,e] : ax2[i,j,e])
         nfy = s_f * (f ≤ 2 ? ay1[i,j,e] : ay2[i,j,e])
-        Fn_self = nfx*F1[i,j,e] + nfy*F2[i,j,e]
-        Fn_nbr  = nfx*F1[ni,nj,nbr] + nfy*F2[ni,nj,nbr]
+        Fn_self = nfx*F1_loc[i,j] + nfy*F2_loc[i,j]
+        Fn_nbr  = nfx*work.face_trace[1,pn,nf,nbr] + nfy*work.face_trace[2,pn,nf,nbr]
         r += idJ * half * (Fn_nbr - Fn_self) / ops.H[row, row]
     end
     @inbounds divF[i,j,e] = r

@@ -26,14 +26,14 @@ _curv_meshes(::Type{T}) where {T} = (
     @testset "free-stream preservation [$name]" for (name, mesh) in _curv_meshes(T)
         elem = make_element(T, N); ops = make_operators(elem)
         geom = make_geometry(mesh, elem); metric = make_metric_terms2d(geom, ops)
-        Ne = geom.Ne
+        work = make_workspace(geom); Ne = geom.Ne
         g1 = zeros(T, N, N, Ne); g2 = similar(g1)
-        apply_gradient2d!(g1, g2, fill(T(2.5), N, N, Ne); geom, ops, metric)
+        apply_gradient2d!(g1, g2, fill(T(2.5), N, N, Ne); geom, ops, metric, work)
         @test maximum(abs, g1) ≤ 1e-10
         @test maximum(abs, g2) ≤ 1e-10
         dv = similar(g1)
         apply_divergence2d!(dv, fill(T(1.3), N, N, Ne), fill(T(-0.7), N, N, Ne);
-                            geom, ops, metric)
+                            geom, ops, metric, work)
         @test maximum(abs, dv) ≤ 1e-10
     end
 
@@ -41,13 +41,13 @@ _curv_meshes(::Type{T}) where {T} = (
     @testset "interior gradient/divergence skew-adjoint [$name]" for (name, mesh) in _curv_meshes(T)
         elem = make_element(T, N); ops = make_operators(elem)
         geom = make_geometry(mesh, elem); metric = make_metric_terms2d(geom, ops)
-        Ne = geom.Ne; n = N*N*Ne
+        work = make_workspace(geom); Ne = geom.Ne; n = N*N*Ne
         Gx = zeros(T, n, n); Dx = zeros(T, n, n)
         u = zeros(T, N, N, Ne); t1 = similar(u); t2 = similar(u); z = zeros(T, N, N, Ne)
         for jc in 1:n
             fill!(u, 0); u[jc] = 1
-            apply_gradient2d!(t1, t2, u; geom, ops, metric); Gx[:, jc] = vec(t1)
-            apply_divergence2d!(t1, u, z; geom, ops, metric); Dx[:, jc] = vec(t1)
+            apply_gradient2d!(t1, t2, u; geom, ops, metric, work); Gx[:, jc] = vec(t1)
+            apply_divergence2d!(t1, u, z; geom, ops, metric, work); Dx[:, jc] = vec(t1)
         end
         Hd = Diagonal(vec(metric.Hd))
         M_mis = Hd*Gx + (Hd*Dx)'
@@ -76,9 +76,10 @@ _curv_meshes(::Type{T}) where {T} = (
             mesh = make_cubed_square_mesh(T, M, T(0.3))
             elem = make_element(T, N); ops = make_operators(elem)
             geom = make_geometry(mesh, elem); metric = make_metric_terms2d(geom, ops)
+            work = make_workspace(geom)
             X = geom.coords[1, :, :, :]; Y = geom.coords[2, :, :, :]
             g1 = similar(X); g2 = similar(X)
-            apply_gradient2d!(g1, g2, f.(X, Y); geom, ops, metric)
+            apply_gradient2d!(g1, g2, f.(X, Y); geom, ops, metric, work)
             e1 = g1 .- fx.(X, Y); e2 = g2 .- fy.(X, Y)
             push!(errs, sqrt(sum(@. (e1^2 + e2^2) * metric.Hd)))
         end
@@ -120,19 +121,21 @@ if _HAS_GPU_2D
             elem = make_element(Tg, N); ops = make_operators(elem)
             geom = make_geometry(mesh, elem)
             metric = make_metric_terms2d(geom, ops); Ne = geom.Ne
+            work = make_workspace(geom)
             Φ  = rand(Tg, N, N, Ne); F1 = rand(Tg, N, N, Ne); F2 = rand(Tg, N, N, Ne)
             g1 = similar(Φ); g2 = similar(Φ); dv = similar(Φ)
-            apply_gradient2d!(g1, g2, Φ; geom, ops, metric)
-            apply_divergence2d!(dv, F1, F2; geom, ops, metric)
+            apply_gradient2d!(g1, g2, Φ; geom, ops, metric, work)
+            apply_divergence2d!(dv, F1, F2; geom, ops, metric, work)
 
             geom_d = to_device(geom, _GPU_BACKEND_2D)
+            work_d = to_device(work, _GPU_BACKEND_2D)
             metric_d = (ax1 = mk(metric.ax1), ax2 = mk(metric.ax2),
                         ay1 = mk(metric.ay1), ay2 = mk(metric.ay2),
                         invdetJ = mk(metric.invdetJ), Hd = mk(metric.Hd))
             Φd = mk(Φ); F1d = mk(F1); F2d = mk(F2)
             g1d = similar(Φd); g2d = similar(Φd); dvd = similar(Φd)
-            apply_gradient2d!(g1d, g2d, Φd; geom = geom_d, ops, metric = metric_d)
-            apply_divergence2d!(dvd, F1d, F2d; geom = geom_d, ops, metric = metric_d)
+            apply_gradient2d!(g1d, g2d, Φd; geom = geom_d, ops, metric = metric_d, work = work_d)
+            apply_divergence2d!(dvd, F1d, F2d; geom = geom_d, ops, metric = metric_d, work = work_d)
             @test Array(g1d) ≈ g1 rtol = 1e-4 atol = 1e-4
             @test Array(g2d) ≈ g2 rtol = 1e-4 atol = 1e-4
             @test Array(dvd) ≈ dv rtol = 1e-4 atol = 1e-4
