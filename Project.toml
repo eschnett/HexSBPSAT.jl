@@ -9,6 +9,7 @@ HexMeshes = "6a780a60-7728-4ca8-aa44-e8f4e6fd1153"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 KrylovKit = "0b1a1467-8014-51b9-945f-bf0ae24f4b77"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
 PolynomialBases = "c74db56a-226d-5e98-8bb0-a6049094aeea"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
@@ -16,7 +17,6 @@ StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [weakdeps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
-Metal = "dde4c033-4e86-420c-a63e-0dd931031962"
 MultiFloats = "bdf0d083-296b-4888-a5b6-7498122e68a5"
 
 [extensions]
