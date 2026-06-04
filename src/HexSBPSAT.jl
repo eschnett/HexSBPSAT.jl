@@ -74,6 +74,9 @@ include("kernels2d.jl")
 # Multi-dimensional axis-selective first derivative (`apply_D!(…, d)`),
 # the building block for the conservative first-order scalar wave.
 include("kernels2d_grad.jl")
+# Curvilinear 2D conservative gradient/divergence (free-stream-
+# preserving, discrete metric terms).
+include("kernels2d_curv.jl")
 
 export
     # Reference element + 1D operators
@@ -82,6 +85,8 @@ export
     build_global_laplacian,
     # Connectivity-driven 1D first derivative (SBP-G + centred-flux SAT)
     apply_D!,
+    # Curvilinear 2D conservative gradient/divergence + metric terms
+    make_metric_terms2d, apply_gradient2d!, apply_divergence2d!,
     # Operator-aware geometry (dimension-generic in `D ∈ {2, 3}`) +
     # the per-call scratch workspace that goes with it.
     MeshGeometry, make_geometry, element_coords,
