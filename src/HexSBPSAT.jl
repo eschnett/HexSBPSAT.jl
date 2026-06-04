@@ -71,6 +71,9 @@ include("geometry.jl")
 include("kernels1d.jl")
 include("kernels3d.jl")
 include("kernels2d.jl")
+# Multi-dimensional axis-selective first derivative (`apply_D!(…, d)`),
+# the building block for the conservative first-order scalar wave.
+include("kernels2d_grad.jl")
 
 export
     # Reference element + 1D operators
