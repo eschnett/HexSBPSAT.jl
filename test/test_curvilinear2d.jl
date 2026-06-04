@@ -87,3 +87,55 @@ _curv_meshes(::Type{T}) where {T} = (
         @test (errs[1] / errs[end])^(1 / (length(errs) - 1)) > 1.5
     end
 end
+
+# GPU smoke test (Metal/CUDA): curvilinear gradient/divergence on-device
+# matches CPU. Mirrors the gating in test_apply_D2d.jl. This is the
+# Phase-3 gate: the operators must agree before the on-device BC /
+# evolution path is trusted. Float32 reduction-order differences set the
+# tolerance.
+if !@isdefined(_HAS_GPU_2D)
+    const _HAS_GPU_2D, _GPU_BACKEND_2D = try
+        if Sys.isapple() && Sys.ARCH === :aarch64
+            @eval using Metal
+            Metal.functional() ? (true, Metal.MetalBackend()) : (false, nothing)
+        elseif !Sys.isapple()
+            @eval using CUDA
+            CUDA.functional() ? (true, CUDA.CUDABackend()) : (false, nothing)
+        else
+            (false, nothing)
+        end
+    catch
+        (false, nothing)
+    end
+end
+
+if _HAS_GPU_2D
+    @testset "curvilinear gradient/divergence on GPU (Float32)" begin
+        _progress("GPU vs CPU curvilinear operator agreement (Float32)")
+        using KernelAbstractions
+        Tg = Float32; N = 4
+        mk(a) = (d = KernelAbstractions.allocate(_GPU_BACKEND_2D, Tg, size(a));
+                 copyto!(d, a); d)
+        @testset "$name" for (name, mesh) in _curv_meshes(Tg)
+            elem = make_element(Tg, N); ops = make_operators(elem)
+            geom = make_geometry(mesh, elem)
+            metric = make_metric_terms2d(geom, ops); Ne = geom.Ne
+            Φ  = rand(Tg, N, N, Ne); F1 = rand(Tg, N, N, Ne); F2 = rand(Tg, N, N, Ne)
+            g1 = similar(Φ); g2 = similar(Φ); dv = similar(Φ)
+            apply_gradient2d!(g1, g2, Φ; geom, ops, metric)
+            apply_divergence2d!(dv, F1, F2; geom, ops, metric)
+
+            geom_d = to_device(geom, _GPU_BACKEND_2D)
+            metric_d = (ax1 = mk(metric.ax1), ax2 = mk(metric.ax2),
+                        ay1 = mk(metric.ay1), ay2 = mk(metric.ay2),
+                        invdetJ = mk(metric.invdetJ), Hd = mk(metric.Hd))
+            Φd = mk(Φ); F1d = mk(F1); F2d = mk(F2)
+            g1d = similar(Φd); g2d = similar(Φd); dvd = similar(Φd)
+            apply_gradient2d!(g1d, g2d, Φd; geom = geom_d, ops, metric = metric_d)
+            apply_divergence2d!(dvd, F1d, F2d; geom = geom_d, ops, metric = metric_d)
+            @test Array(g1d) ≈ g1 rtol = 1e-4 atol = 1e-4
+            @test Array(g2d) ≈ g2 rtol = 1e-4 atol = 1e-4
+            @test Array(dvd) ≈ dv rtol = 1e-4 atol = 1e-4
+        end
+    end
+end

@@ -71,6 +71,21 @@ function apply_gradient2d!(g1::AbstractArray{T,3}, g2::AbstractArray{T,3},
                            Φ::AbstractArray{T,3};
                            geom::MeshGeometry{2,T,N}, ops::SBPOps{N,T},
                            metric) where {T,N}
+    backend = get_backend(Φ)
+    if backend isa KernelAbstractions.CPU
+        return _grad2d_cpu!(g1, g2, Φ, geom, ops, metric)
+    end
+    _grad2d_kernel!(backend, (N, N))(
+        g1, g2, Φ, ops, metric.ax1, metric.ax2, metric.ay1, metric.ay2,
+        metric.invdetJ, geom.conn.neighbour, geom.conn.neighbour_face,
+        geom.conn.orientation, geom.conn.bdry, Val(N);
+        ndrange = (N, N, geom.Ne))
+    return g1, g2
+end
+
+@inline function _grad2d_cpu!(g1::AbstractArray{T,3}, g2::AbstractArray{T,3},
+                              Φ::AbstractArray{T,3}, geom::MeshGeometry{2,T,N},
+                              ops::SBPOps{N,T}, metric) where {T,N}
     Ne = geom.Ne; G = ops.G; conn = geom.conn
     H1 = SVector{N,T}(ntuple(i -> ops.H[i, i], Val(N)))
     (; ax1, ax2, ay1, ay2, invdetJ) = metric
@@ -125,6 +140,22 @@ function apply_divergence2d!(divF::AbstractArray{T,3},
                              F1::AbstractArray{T,3}, F2::AbstractArray{T,3};
                              geom::MeshGeometry{2,T,N}, ops::SBPOps{N,T},
                              metric) where {T,N}
+    backend = get_backend(divF)
+    if backend isa KernelAbstractions.CPU
+        return _div2d_cpu!(divF, F1, F2, geom, ops, metric)
+    end
+    _div2d_kernel!(backend, (N, N))(
+        divF, F1, F2, ops, metric.ax1, metric.ax2, metric.ay1, metric.ay2,
+        metric.invdetJ, geom.conn.neighbour, geom.conn.neighbour_face,
+        geom.conn.orientation, geom.conn.bdry, Val(N);
+        ndrange = (N, N, geom.Ne))
+    return divF
+end
+
+@inline function _div2d_cpu!(divF::AbstractArray{T,3},
+                             F1::AbstractArray{T,3}, F2::AbstractArray{T,3},
+                             geom::MeshGeometry{2,T,N}, ops::SBPOps{N,T},
+                             metric) where {T,N}
     Ne = geom.Ne; G = ops.G; conn = geom.conn
     H1 = SVector{N,T}(ntuple(i -> ops.H[i, i], Val(N)))
     (; ax1, ax2, ay1, ay2, invdetJ) = metric
@@ -166,4 +197,88 @@ function apply_divergence2d!(divF::AbstractArray{T,3},
         end
     end
     return divF
+end
+
+################################################################################
+# GPU kernels (KernelAbstractions). Workgroup-per-element, N² workitems;
+# each workitem (i, j) computes one node's output from global reads (no
+# shared-memory staging — correctness-first), then adds the centred-flux
+# SAT for any boundary face it lies on (a node touches ≤ 2 faces; each
+# workitem writes only its own node, so no atomics). Mirror the CPU
+# split-form volume + SAT exactly.
+
+@kernel function _grad2d_kernel!(g1, g2, @Const(Φ), ops,
+                                 @Const(ax1), @Const(ax2), @Const(ay1),
+                                 @Const(ay2), @Const(invdetJ),
+                                 @Const(neighbour), @Const(nbr_face),
+                                 @Const(orient), @Const(bdry),
+                                 ::Val{N}) where {N}
+    i, j, e = @index(Global, NTuple)
+    T = eltype(g1); G = ops.G; half = T(1) / 2
+    csx = zero(T); csy = zero(T); gξ = zero(T); gη = zero(T)
+    @inbounds for p in 1:N
+        Gip = G[i, p]; Gjp = G[j, p]
+        csx += Gip*ax1[p,j,e]*Φ[p,j,e] + Gjp*ax2[i,p,e]*Φ[i,p,e]
+        csy += Gip*ay1[p,j,e]*Φ[p,j,e] + Gjp*ay2[i,p,e]*Φ[i,p,e]
+        gξ  += Gip*Φ[p,j,e]; gη += Gjp*Φ[i,p,e]
+    end
+    @inbounds idJ = invdetJ[i,j,e]
+    @inbounds r1 = half*(csx + ax1[i,j,e]*gξ + ax2[i,j,e]*gη)*idJ
+    @inbounds r2 = half*(csy + ay1[i,j,e]*gξ + ay2[i,j,e]*gη)*idJ
+    @inbounds for f in 1:4
+        bdry[f,e] == 0 || continue
+        a_idx = (f + 1) ÷ 2; row = isodd(f) ? 1 : N
+        on = a_idx == 1 ? (i == row) : (j == row)
+        on || continue
+        p_local = a_idx == 1 ? j : i
+        nbr = Int(neighbour[f,e]); nf = Int(nbr_face[f,e]); o = Int(orient[f,e])
+        s_f = isodd(f) ? -one(T) : one(T)
+        pn = _neigh_p(o, p_local, N); ni, nj = _facenode2d(nf, pn, Val(N))
+        jump = Φ[ni,nj,nbr] - Φ[i,j,e]
+        nfx = s_f * (f ≤ 2 ? ax1[i,j,e] : ax2[i,j,e])
+        nfy = s_f * (f ≤ 2 ? ay1[i,j,e] : ay2[i,j,e])
+        c = idJ * half * jump / ops.H[row, row]
+        r1 += c*nfx; r2 += c*nfy
+    end
+    @inbounds g1[i,j,e] = r1
+    @inbounds g2[i,j,e] = r2
+end
+
+@kernel function _div2d_kernel!(divF, @Const(F1), @Const(F2), ops,
+                                @Const(ax1), @Const(ax2), @Const(ay1),
+                                @Const(ay2), @Const(invdetJ),
+                                @Const(neighbour), @Const(nbr_face),
+                                @Const(orient), @Const(bdry),
+                                ::Val{N}) where {N}
+    i, j, e = @index(Global, NTuple)
+    T = eltype(divF); G = ops.G; half = T(1) / 2
+    cs = zero(T); gξF1 = zero(T); gηF1 = zero(T); gξF2 = zero(T); gηF2 = zero(T)
+    @inbounds for p in 1:N
+        Gip = G[i,p]; Gjp = G[j,p]
+        Ft1 = ax1[p,j,e]*F1[p,j,e] + ay1[p,j,e]*F2[p,j,e]
+        Ft2 = ax2[i,p,e]*F1[i,p,e] + ay2[i,p,e]*F2[i,p,e]
+        cs += Gip*Ft1 + Gjp*Ft2
+        gξF1 += Gip*F1[p,j,e]; gηF1 += Gjp*F1[i,p,e]
+        gξF2 += Gip*F2[p,j,e]; gηF2 += Gjp*F2[i,p,e]
+    end
+    @inbounds idJ = invdetJ[i,j,e]
+    @inbounds ad = ax1[i,j,e]*gξF1 + ax2[i,j,e]*gηF1 +
+                   ay1[i,j,e]*gξF2 + ay2[i,j,e]*gηF2
+    r = half*(cs + ad)*idJ
+    @inbounds for f in 1:4
+        bdry[f,e] == 0 || continue
+        a_idx = (f + 1) ÷ 2; row = isodd(f) ? 1 : N
+        on = a_idx == 1 ? (i == row) : (j == row)
+        on || continue
+        p_local = a_idx == 1 ? j : i
+        nbr = Int(neighbour[f,e]); nf = Int(nbr_face[f,e]); o = Int(orient[f,e])
+        s_f = isodd(f) ? -one(T) : one(T)
+        pn = _neigh_p(o, p_local, N); ni, nj = _facenode2d(nf, pn, Val(N))
+        nfx = s_f * (f ≤ 2 ? ax1[i,j,e] : ax2[i,j,e])
+        nfy = s_f * (f ≤ 2 ? ay1[i,j,e] : ay2[i,j,e])
+        Fn_self = nfx*F1[i,j,e] + nfy*F2[i,j,e]
+        Fn_nbr  = nfx*F1[ni,nj,nbr] + nfy*F2[ni,nj,nbr]
+        r += idJ * half * (Fn_nbr - Fn_self) / ops.H[row, row]
+    end
+    @inbounds divF[i,j,e] = r
 end
