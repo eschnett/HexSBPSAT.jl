@@ -85,4 +85,59 @@ end
             @test maximum(abs.(Du2 .- exact2)) ≤ 1e-9 * max(1, M^p)
         end
     end
+
+    _progress("device round-trip (CPU)")
+    @testset "to_device CPU round-trip" begin
+        using KernelAbstractions: CPU
+        N, M = 4, 4
+        mesh = make_uniform_quad(T, M, M, 0.0, 1.0; periodic = true)
+        elem = make_element(T, N); ops = make_operators(elem)
+        geom = make_geometry(mesh, elem)
+        geom2 = to_device(geom, CPU())
+        u = rand(T, N, N, geom.Ne)
+        for d in (1, 2)
+            Du = similar(u); Du2 = similar(u)
+            apply_D!(Du, u, d; geom, ops)
+            apply_D!(Du2, u, d; geom = geom2, ops)
+            @test Du == Du2
+        end
+    end
+end
+
+# GPU smoke test (Metal/CUDA): apply_D! on-device matches CPU. Mirrors
+# the gating in the top-level runtests.jl (Metal/CUDA added there).
+if !@isdefined(_HAS_GPU_2D)
+    const _HAS_GPU_2D, _GPU_BACKEND_2D = try
+        if Sys.isapple() && Sys.ARCH === :aarch64
+            @eval using Metal
+            Metal.functional() ? (true, Metal.MetalBackend()) : (false, nothing)
+        elseif !Sys.isapple()
+            @eval using CUDA
+            CUDA.functional() ? (true, CUDA.CUDABackend()) : (false, nothing)
+        else
+            (false, nothing)
+        end
+    catch
+        (false, nothing)
+    end
+end
+
+if _HAS_GPU_2D
+    @testset "apply_D! 2D on GPU (Float32)" begin
+        _progress("GPU vs CPU agreement (Float32)")
+        using KernelAbstractions
+        Tg = Float32; N = 4; M = 4
+        mesh = make_uniform_quad(Tg, M, M, 0.0f0, 1.0f0; periodic = true)
+        elem = make_element(Tg, N); ops = make_operators(elem)
+        geom = make_geometry(mesh, elem)
+        u = rand(Tg, N, N, geom.Ne)
+        geom_d = to_device(geom, _GPU_BACKEND_2D)
+        u_d = KernelAbstractions.allocate(_GPU_BACKEND_2D, Tg, N, N, geom.Ne)
+        copyto!(u_d, u)
+        for d in (1, 2)
+            Du = similar(u); apply_D!(Du, u, d; geom, ops)
+            Du_d = similar(u_d); apply_D!(Du_d, u_d, d; geom = geom_d, ops)
+            @test Array(Du_d) ≈ Du rtol = 1e-5
+        end
+    end
 end

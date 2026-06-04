@@ -41,7 +41,74 @@ function apply_D!(Du::AbstractArray{T,3}, u::AbstractArray{T,3}, d::Integer;
     if backend isa KernelAbstractions.CPU
         return _apply_D_2d_cpu!(Du, u, d, geom, ops)
     end
-    error("apply_D! 2D: GPU path not yet implemented")
+    _apply_D_2d_kernel!(backend, (N, N))(
+        Du, u, ops, geom.conn.neighbour, geom.conn.neighbour_face,
+        geom.conn.orientation, geom.conn.bdry, geom.invjac,
+        Val(Int(d)), Val(N); ndrange = (N, N, geom.Ne))
+    return Du
+end
+
+# KA kernel — workgroup-per-element, N² workitems; mirrors the CPU
+# per-element flow. `u_loc` stages the element into shared memory for
+# the volume stencil; neighbour face values are read from global `u`.
+@kernel function _apply_D_2d_kernel!(Du::AbstractArray{T,3},
+                                     @Const(u::AbstractArray{T,3}),
+                                     ops, @Const(neighbour),
+                                     @Const(nbr_face), @Const(orient),
+                                     @Const(bdry), @Const(invjac),
+                                     ::Val{d}, ::Val{N}) where {T, d, N}
+    i, j, m = @index(Global, NTuple)
+    il, jl = @index(Local, NTuple)
+
+    u_loc = @localmem T (N, N)
+    @inbounds u_loc[il, jl] = u[i, j, m]
+    @synchronize
+
+    i, j, m = @index(Global, NTuple)
+    il, jl = @index(Local, NTuple)
+    half = T(1) / T(2)
+    G = ops.G; H1 = ops.H
+
+    # Volume term.
+    s = zero(T)
+    if d == 1
+        @inbounds for p in 1:N
+            s += G[il, p] * u_loc[p, jl]
+        end
+        @inbounds s *= invjac[1, 1, i, j, m]
+    else
+        @inbounds for p in 1:N
+            s += G[jl, p] * u_loc[il, p]
+        end
+        @inbounds s *= invjac[2, 2, i, j, m]
+    end
+
+    # Centred-flux SAT at the two faces normal to axis d.
+    fm = 2d - 1; fp = 2d
+    @inbounds begin
+        on_lo = (d == 1) ? (i == 1) : (j == 1)
+        on_hi = (d == 1) ? (i == N) : (j == N)
+        if on_lo && bdry[fm, m] == 0
+            nbr = Int(neighbour[fm, m]); nf = Int(nbr_face[fm, m])
+            o   = Int(orient[fm, m]);    nn = isodd(nf) ? 1 : N
+            t   = (d == 1) ? j : i
+            tn  = _neigh_p(o, t, N)
+            u_self = u_loc[il, jl]
+            u_nbr  = (d == 1) ? u[nn, tn, nbr] : u[tn, nn, nbr]
+            s += (u_self - u_nbr) * half * invjac[d, d, i, j, m] / H1[1, 1]
+        end
+        if on_hi && bdry[fp, m] == 0
+            nbr = Int(neighbour[fp, m]); nf = Int(nbr_face[fp, m])
+            o   = Int(orient[fp, m]);    nn = isodd(nf) ? 1 : N
+            t   = (d == 1) ? j : i
+            tn  = _neigh_p(o, t, N)
+            u_self = u_loc[il, jl]
+            u_nbr  = (d == 1) ? u[nn, tn, nbr] : u[tn, nn, nbr]
+            s += (u_nbr - u_self) * half * invjac[d, d, i, j, m] / H1[N, N]
+        end
+    end
+
+    @inbounds Du[i, j, m] = s
 end
 
 @inline function _apply_D_2d_cpu!(Du::AbstractArray{T,3}, u::AbstractArray{T,3},
