@@ -24,48 +24,88 @@
 # (−faces 1,3,5 → node 1; +faces 2,4,6 → node N).
 @inline _face_node(nf, ::Val{N}) where {N} = isodd(nf) ? 1 : N
 
+# ---- Shared face-node gather (pass 1 of the two-pass 2D operators) ----
+# Write each element's INTERIOR-face node values into the workspace face
+# trace, following the `_facenode2d` convention (face 1,2 → p = η index j;
+# face 3,4 → p = ξ index i). Outer faces (`bdry ≠ 0`) carry no SAT and are
+# skipped. Used by `apply_D!` (1 channel) and `apply_gradient2d!` /
+# `apply_divergence2d!` (1 / 2 channels) — the single source of the
+# inter-element communication.
+@kernel function _gather_face2d_1ch!(@Const(u), work, @Const(bdry),
+                                     ::Val{N}) where {N}
+    i, j, e = @index(Global, NTuple)
+    @inbounds begin
+        v = u[i, j, e]
+        if i == 1 && bdry[1, e] == 0; work.face_trace[1, j, 1, e] = v; end
+        if i == N && bdry[2, e] == 0; work.face_trace[1, j, 2, e] = v; end
+        if j == 1 && bdry[3, e] == 0; work.face_trace[1, i, 3, e] = v; end
+        if j == N && bdry[4, e] == 0; work.face_trace[1, i, 4, e] = v; end
+    end
+end
+
+@kernel function _gather_face2d_2ch!(@Const(F1), @Const(F2), work,
+                                     @Const(bdry), ::Val{N}) where {N}
+    i, j, e = @index(Global, NTuple)
+    @inbounds begin
+        v1 = F1[i, j, e]; v2 = F2[i, j, e]
+        if i == 1 && bdry[1, e] == 0
+            work.face_trace[1, j, 1, e] = v1; work.face_trace[2, j, 1, e] = v2
+        end
+        if i == N && bdry[2, e] == 0
+            work.face_trace[1, j, 2, e] = v1; work.face_trace[2, j, 2, e] = v2
+        end
+        if j == 1 && bdry[3, e] == 0
+            work.face_trace[1, i, 3, e] = v1; work.face_trace[2, i, 3, e] = v2
+        end
+        if j == N && bdry[4, e] == 0
+            work.face_trace[1, i, 4, e] = v1; work.face_trace[2, i, 4, e] = v2
+        end
+    end
+end
+
 """
-    apply_D!(Du, u, d::Integer; geom::MeshGeometry{2, T, N}, ops) → Du
+    apply_D!(Du, u, d::Integer; geom::MeshGeometry{2, T, N}, ops, work) → Du
 
 Physical `d`-th partial derivative (`d ∈ {1, 2}`) of the scalar field
 `u :: (N, N, Ne)`, written into `Du`, via reference SBP-G along axis
 `d` plus centred-flux SAT at the two faces normal to `d` (neighbour
 relation from `geom.conn`). Axis-aligned affine meshes only (diagonal
-`invjac`); `H·D` is then exactly skew.
+`invjac`); `H·D` is then exactly skew. Two KernelAbstractions passes
+(gather → volume+SAT) that run on both CPU and GPU; `work` supplies the
+face-trace buffer (channel 1).
 """
 function apply_D!(Du::AbstractArray{T,3}, u::AbstractArray{T,3}, d::Integer;
-                  geom::MeshGeometry{2, T, N}, ops::SBPOps{N, T}) where {N, T}
+                  geom::MeshGeometry{2, T, N}, ops::SBPOps{N, T},
+                  work::MeshWorkspace{2, T, N}) where {N, T}
     @assert size(u) == size(Du) == (N, N, geom.Ne)
     @assert d == 1 || d == 2
     backend = get_backend(u)
-    if backend isa KernelAbstractions.CPU
-        return _apply_D_2d_cpu!(Du, u, d, geom, ops)
-    end
-    _apply_D_2d_kernel!(backend, (N, N))(
-        Du, u, ops, geom.conn.neighbour, geom.conn.neighbour_face,
+    _gather_face2d_1ch!(backend, (N, N))(
+        u, work, geom.conn.bdry, Val(N); ndrange = (N, N, geom.Ne))
+    _apply_D_2d_volume_kernel!(backend, N^2)(
+        Du, u, work, ops, geom.conn.neighbour, geom.conn.neighbour_face,
         geom.conn.orientation, geom.conn.bdry, geom.invjac,
-        Val(Int(d)), Val(N); ndrange = (N, N, geom.Ne))
+        Val(Int(d)), Val(N); ndrange = N^2 * geom.Ne)
     return Du
 end
 
-# KA kernel — workgroup-per-element, N² workitems; mirrors the CPU
-# per-element flow. `u_loc` stages the element into shared memory for
-# the volume stencil; neighbour face values are read from global `u`.
-@kernel function _apply_D_2d_kernel!(Du::AbstractArray{T,3},
-                                     @Const(u::AbstractArray{T,3}),
-                                     ops, @Const(neighbour),
-                                     @Const(nbr_face), @Const(orient),
-                                     @Const(bdry), @Const(invjac),
-                                     ::Val{d}, ::Val{N}) where {T, d, N}
-    i, j, m = @index(Global, NTuple)
-    il, jl = @index(Local, NTuple)
-
+# Pass 2: per element, stage u into `@localmem`, reference d-derivative ×
+# invjac[d,d], then centred-flux SAT at the two faces normal to d, reading
+# the neighbour's gathered trace. One write per node.
+@kernel function _apply_D_2d_volume_kernel!(Du::AbstractArray{T}, @Const(u),
+                                            work, ops, @Const(neighbour),
+                                            @Const(nbr_face), @Const(orient),
+                                            @Const(bdry), @Const(invjac),
+                                            ::Val{d}, ::Val{N}) where {T, d, N}
+    e    = @index(Group, Linear)
+    li   = @index(Local, Linear)
+    i, j = _ij_from_li(li, Val(N))
     u_loc = @localmem T (N, N)
-    @inbounds u_loc[il, jl] = u[i, j, m]
+    @inbounds u_loc[i, j] = u[i, j, e]
     @synchronize
-
-    i, j, m = @index(Global, NTuple)
-    il, jl = @index(Local, NTuple)
+    e    = @index(Group, Linear)
+    li   = @index(Local, Linear)
+    i, j = _ij_from_li(li, Val(N))
     half = T(1) / T(2)
     G = ops.G; H1 = ops.H
 
@@ -73,121 +113,37 @@ end
     s = zero(T)
     if d == 1
         @inbounds for p in 1:N
-            s += G[il, p] * u_loc[p, jl]
+            s += G[i, p] * u_loc[p, j]
         end
-        @inbounds s *= invjac[1, 1, i, j, m]
+        @inbounds s *= invjac[1, 1, i, j, e]
     else
         @inbounds for p in 1:N
-            s += G[jl, p] * u_loc[il, p]
+            s += G[j, p] * u_loc[i, p]
         end
-        @inbounds s *= invjac[2, 2, i, j, m]
+        @inbounds s *= invjac[2, 2, i, j, e]
     end
 
     # Centred-flux SAT at the two faces normal to axis d.
-    fm = 2d - 1; fp = 2d
     @inbounds begin
         on_lo = (d == 1) ? (i == 1) : (j == 1)
         on_hi = (d == 1) ? (i == N) : (j == N)
-        if on_lo && bdry[fm, m] == 0
-            nbr = Int(neighbour[fm, m]); nf = Int(nbr_face[fm, m])
-            o   = Int(orient[fm, m]);    nn = isodd(nf) ? 1 : N
+        if on_lo && bdry[2d - 1, e] == 0
+            nbr = Int(neighbour[2d-1, e]); nf = Int(nbr_face[2d-1, e])
+            o   = Int(orient[2d-1, e])
             t   = (d == 1) ? j : i
             tn  = _neigh_p(o, t, N)
-            u_self = u_loc[il, jl]
-            u_nbr  = (d == 1) ? u[nn, tn, nbr] : u[tn, nn, nbr]
-            s += (u_self - u_nbr) * half * invjac[d, d, i, j, m] / H1[1, 1]
+            u_nbr = work.face_trace[1, tn, nf, nbr]
+            s += (u_loc[i, j] - u_nbr) * half * invjac[d, d, i, j, e] / H1[1, 1]
         end
-        if on_hi && bdry[fp, m] == 0
-            nbr = Int(neighbour[fp, m]); nf = Int(nbr_face[fp, m])
-            o   = Int(orient[fp, m]);    nn = isodd(nf) ? 1 : N
+        if on_hi && bdry[2d, e] == 0
+            nbr = Int(neighbour[2d, e]); nf = Int(nbr_face[2d, e])
+            o   = Int(orient[2d, e])
             t   = (d == 1) ? j : i
             tn  = _neigh_p(o, t, N)
-            u_self = u_loc[il, jl]
-            u_nbr  = (d == 1) ? u[nn, tn, nbr] : u[tn, nn, nbr]
-            s += (u_nbr - u_self) * half * invjac[d, d, i, j, m] / H1[N, N]
+            u_nbr = work.face_trace[1, tn, nf, nbr]
+            s += (u_nbr - u_loc[i, j]) * half * invjac[d, d, i, j, e] / H1[N, N]
         end
     end
 
-    @inbounds Du[i, j, m] = s
-end
-
-@inline function _apply_D_2d_cpu!(Du::AbstractArray{T,3}, u::AbstractArray{T,3},
-                                  d::Integer, geom::MeshGeometry{2, T, N},
-                                  ops::SBPOps{N, T}) where {N, T}
-    Ne        = geom.Ne
-    neighbour = geom.conn.neighbour
-    nbr_face  = geom.conn.neighbour_face
-    orient    = geom.conn.orientation
-    bdry      = geom.conn.bdry
-    half      = one(T) / 2
-    fm, fp    = _axis_faces(d)            # −d face, +d face
-    G         = ops.G
-    H1        = ops.H
-
-    @inbounds for m in 1:Ne
-        # Volume term: reference d-derivative × invjac[d,d] (diagonal).
-        if d == 1
-            for j in 1:N, i in 1:N
-                s = zero(T)
-                for p in 1:N
-                    s += G[i, p] * u[p, j, m]
-                end
-                Du[i, j, m] = s * geom.invjac[1, 1, i, j, m]
-            end
-        else
-            for j in 1:N, i in 1:N
-                s = zero(T)
-                for p in 1:N
-                    s += G[j, p] * u[i, p, m]
-                end
-                Du[i, j, m] = s * geom.invjac[2, 2, i, j, m]
-            end
-        end
-
-        # Centred-flux SAT at the −d and +d faces. Coefficient uses the
-        # 1D-direction weight H_1d[face] and the along-axis invjac.
-        # −d face (along-axis node 1):
-        if bdry[fm, m] == 0
-            nbr = Int(neighbour[fm, m])
-            nf  = Int(nbr_face[fm, m])
-            o   = Int(orient[fm, m])
-            nn  = _face_node(nf, Val(N))
-            for t in 1:N                      # transverse node on self
-                tn = _neigh_p(o, t, N)        # transverse node on neighbour
-                if d == 1
-                    u_self = u[1, t, m]
-                    u_nbr  = u[nn, tn, nbr]
-                    Du[1, t, m] += (u_self - u_nbr) * half *
-                                   geom.invjac[1, 1, 1, t, m] / H1[1, 1]
-                else
-                    u_self = u[t, 1, m]
-                    u_nbr  = u[tn, nn, nbr]
-                    Du[t, 1, m] += (u_self - u_nbr) * half *
-                                   geom.invjac[2, 2, t, 1, m] / H1[1, 1]
-                end
-            end
-        end
-        # +d face (along-axis node N):
-        if bdry[fp, m] == 0
-            nbr = Int(neighbour[fp, m])
-            nf  = Int(nbr_face[fp, m])
-            o   = Int(orient[fp, m])
-            nn  = _face_node(nf, Val(N))
-            for t in 1:N
-                tn = _neigh_p(o, t, N)
-                if d == 1
-                    u_self = u[N, t, m]
-                    u_nbr  = u[nn, tn, nbr]
-                    Du[N, t, m] += (u_nbr - u_self) * half *
-                                   geom.invjac[1, 1, N, t, m] / H1[N, N]
-                else
-                    u_self = u[t, N, m]
-                    u_nbr  = u[tn, nn, nbr]
-                    Du[t, N, m] += (u_nbr - u_self) * half *
-                                   geom.invjac[2, 2, t, N, m] / H1[N, N]
-                end
-            end
-        end
-    end
-    return Du
+    @inbounds Du[i, j, e] = s
 end

@@ -90,7 +90,7 @@ function apply_gradient2d!(g1::AbstractArray{T,3}, g2::AbstractArray{T,3},
                            geom::MeshGeometry{2,T,N}, ops::SBPOps{N,T},
                            metric, work::MeshWorkspace{2,T,N}) where {T,N}
     backend = get_backend(Φ)
-    _grad2d_gather_kernel!(backend, (N, N))(
+    _gather_face2d_1ch!(backend, (N, N))(
         Φ, work, geom.conn.bdry, Val(N); ndrange = (N, N, geom.Ne))
     _grad2d_volume_kernel!(backend, N^2)(
         g1, g2, Φ, work, ops, metric.ax1, metric.ax2, metric.ay1, metric.ay2,
@@ -100,22 +100,9 @@ function apply_gradient2d!(g1::AbstractArray{T,3}, g2::AbstractArray{T,3},
     return g1, g2
 end
 
-# Pass 1: write each element's face-node Φ into `work.face_trace[1, p, f, e]`
-# following the `_facenode2d` convention (face 1,2 → p = η index j;
-# face 3,4 → p = ξ index i). Skips outer faces (`bdry ≠ 0`); they carry no
-# SAT and their traces are never read.
-@kernel function _grad2d_gather_kernel!(@Const(Φ), work, @Const(bdry),
-                                        ::Val{N}) where {N}
-    i, j, e = @index(Global, NTuple)
-    @inbounds begin
-        v = Φ[i, j, e]
-        if i == 1 && bdry[1, e] == 0; work.face_trace[1, j, 1, e] = v; end
-        if i == N && bdry[2, e] == 0; work.face_trace[1, j, 2, e] = v; end
-        if j == 1 && bdry[3, e] == 0; work.face_trace[1, i, 3, e] = v; end
-        if j == N && bdry[4, e] == 0; work.face_trace[1, i, 4, e] = v; end
-    end
-end
-
+# Pass 1 (gather) is the shared `_gather_face2d_1ch!` (Φ → channel 1),
+# defined in kernels2d_grad.jl.
+#
 # Pass 2: per element, stage Φ into `@localmem`, do the split-form volume
 # reduction, then apply the centred-flux SAT reading the neighbour's
 # gathered trace. One write per node (gather, no scatter).
@@ -178,7 +165,7 @@ function apply_divergence2d!(divF::AbstractArray{T,3},
                              geom::MeshGeometry{2,T,N}, ops::SBPOps{N,T},
                              metric, work::MeshWorkspace{2,T,N}) where {T,N}
     backend = get_backend(divF)
-    _div2d_gather_kernel!(backend, (N, N))(
+    _gather_face2d_2ch!(backend, (N, N))(
         F1, F2, work, geom.conn.bdry, Val(N); ndrange = (N, N, geom.Ne))
     _div2d_volume_kernel!(backend, N^2)(
         divF, F1, F2, work, ops, metric.ax1, metric.ax2, metric.ay1, metric.ay2,
@@ -188,27 +175,9 @@ function apply_divergence2d!(divF::AbstractArray{T,3},
     return divF
 end
 
-# Pass 1: write each element's face-node (F1, F2) into channels 1, 2.
-@kernel function _div2d_gather_kernel!(@Const(F1), @Const(F2), work,
-                                       @Const(bdry), ::Val{N}) where {N}
-    i, j, e = @index(Global, NTuple)
-    @inbounds begin
-        v1 = F1[i, j, e]; v2 = F2[i, j, e]
-        if i == 1 && bdry[1, e] == 0
-            work.face_trace[1, j, 1, e] = v1; work.face_trace[2, j, 1, e] = v2
-        end
-        if i == N && bdry[2, e] == 0
-            work.face_trace[1, j, 2, e] = v1; work.face_trace[2, j, 2, e] = v2
-        end
-        if j == 1 && bdry[3, e] == 0
-            work.face_trace[1, i, 3, e] = v1; work.face_trace[2, i, 3, e] = v2
-        end
-        if j == N && bdry[4, e] == 0
-            work.face_trace[1, i, 4, e] = v1; work.face_trace[2, i, 4, e] = v2
-        end
-    end
-end
-
+# Pass 1 (gather) is the shared `_gather_face2d_2ch!` (F1, F2 → channels
+# 1, 2), defined in kernels2d_grad.jl.
+#
 # Pass 2: stage (F1, F2) into `@localmem`, split-form volume divergence,
 # then centred-flux SAT reading the neighbour's gathered (F1, F2).
 @kernel function _div2d_volume_kernel!(divF::AbstractArray{T},

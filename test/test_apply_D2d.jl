@@ -14,10 +14,11 @@ using Test
 function _dense_D2d(geom, ops, d, ::Type{T}, N, Ne) where {T}
     n = N * N * Ne
     A = zeros(T, n, n)
+    work = make_workspace(geom)
     u = zeros(T, N, N, Ne); Du = similar(u)
     for j in 1:n
         fill!(u, 0); u[j] = 1
-        apply_D!(Du, u, d; geom, ops)
+        apply_D!(Du, u, d; geom, ops, work)
         A[:, j] = vec(Du)
     end
     return A
@@ -48,19 +49,19 @@ end
         for M in (4, 8, 16)
             mesh = make_uniform_quad(T, M, M, 0.0, 1.0; periodic = true)
             elem = make_element(T, N); ops = make_operators(elem)
-            geom = make_geometry(mesh, elem)
+            geom = make_geometry(mesh, elem); work = make_workspace(geom)
             xs = geom.coords[1, :, :, :]; ys = geom.coords[2, :, :, :]
 
             ux = sinpi.(2 .* xs); Dux = similar(ux)
-            apply_D!(Dux, ux, 1; geom, ops)
+            apply_D!(Dux, ux, 1; geom, ops, work)
             push!(ex, maximum(abs.(Dux .- 2π .* cospi.(2 .* xs))))
             # ∂x of a y-only field must vanish.
             uy = sinpi.(2 .* ys); Duxy = similar(uy)
-            apply_D!(Duxy, uy, 1; geom, ops)
+            apply_D!(Duxy, uy, 1; geom, ops, work)
             @test maximum(abs.(Duxy)) ≤ 1e-10
 
             Duy = similar(uy)
-            apply_D!(Duy, uy, 2; geom, ops)
+            apply_D!(Duy, uy, 2; geom, ops, work)
             push!(ey, maximum(abs.(Duy .- 2π .* cospi.(2 .* ys))))
         end
         @test all(>(2.4), log2.(ex[1:end-1] ./ ex[2:end]))
@@ -74,13 +75,13 @@ end
         N, M = 5, 3
         mesh = make_uniform_quad(T, M, M, -1.0, 1.0; periodic = false)
         elem = make_element(T, N); ops = make_operators(elem)
-        geom = make_geometry(mesh, elem)
+        geom = make_geometry(mesh, elem); work = make_workspace(geom)
         xs = geom.coords[1, :, :, :]; ys = geom.coords[2, :, :, :]
         for p in 0:N-1
-            u = xs .^ p; Du = similar(u); apply_D!(Du, u, 1; geom, ops)
+            u = xs .^ p; Du = similar(u); apply_D!(Du, u, 1; geom, ops, work)
             exact = p == 0 ? zero(xs) : p .* xs .^ (p - 1)
             @test maximum(abs.(Du .- exact)) ≤ 1e-9 * max(1, M^p)
-            u2 = ys .^ p; Du2 = similar(u2); apply_D!(Du2, u2, 2; geom, ops)
+            u2 = ys .^ p; Du2 = similar(u2); apply_D!(Du2, u2, 2; geom, ops, work)
             exact2 = p == 0 ? zero(ys) : p .* ys .^ (p - 1)
             @test maximum(abs.(Du2 .- exact2)) ≤ 1e-9 * max(1, M^p)
         end
@@ -92,13 +93,13 @@ end
         N, M = 4, 4
         mesh = make_uniform_quad(T, M, M, 0.0, 1.0; periodic = true)
         elem = make_element(T, N); ops = make_operators(elem)
-        geom = make_geometry(mesh, elem)
-        geom2 = to_device(geom, CPU())
+        geom = make_geometry(mesh, elem); work = make_workspace(geom)
+        geom2 = to_device(geom, CPU()); work2 = to_device(work, CPU())
         u = rand(T, N, N, geom.Ne)
         for d in (1, 2)
             Du = similar(u); Du2 = similar(u)
-            apply_D!(Du, u, d; geom, ops)
-            apply_D!(Du2, u, d; geom = geom2, ops)
+            apply_D!(Du, u, d; geom, ops, work)
+            apply_D!(Du2, u, d; geom = geom2, ops, work = work2)
             @test Du == Du2
         end
     end
@@ -129,14 +130,15 @@ if _HAS_GPU_2D
         Tg = Float32; N = 4; M = 4
         mesh = make_uniform_quad(Tg, M, M, 0.0f0, 1.0f0; periodic = true)
         elem = make_element(Tg, N); ops = make_operators(elem)
-        geom = make_geometry(mesh, elem)
+        geom = make_geometry(mesh, elem); work = make_workspace(geom)
         u = rand(Tg, N, N, geom.Ne)
         geom_d = to_device(geom, _GPU_BACKEND_2D)
+        work_d = to_device(work, _GPU_BACKEND_2D)
         u_d = KernelAbstractions.allocate(_GPU_BACKEND_2D, Tg, N, N, geom.Ne)
         copyto!(u_d, u)
         for d in (1, 2)
-            Du = similar(u); apply_D!(Du, u, d; geom, ops)
-            Du_d = similar(u_d); apply_D!(Du_d, u_d, d; geom = geom_d, ops)
+            Du = similar(u); apply_D!(Du, u, d; geom, ops, work)
+            Du_d = similar(u_d); apply_D!(Du_d, u_d, d; geom = geom_d, ops, work = work_d)
             @test Array(Du_d) ≈ Du rtol = 1e-5
         end
     end
