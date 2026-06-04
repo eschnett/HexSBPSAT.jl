@@ -2,10 +2,18 @@
 # curvilinear 2D meshes: make_metric_terms2d + apply_gradient2d! /
 # apply_divergence2d! (split skew-symmetric form). Cubed-square mesh.
 
-using HexMeshes: make_cubed_square_mesh
+using HexMeshes: make_cubed_square_mesh, make_inflated_square_mesh
 using HexSBPSAT
 using LinearAlgebra
 using Test
+
+# Curvilinear test meshes at small M. cubed_square has all-zero
+# connectivity orientation; inflated_square mixes orientations {0,1},
+# so it exercises the SAT's `_neigh_p` transform.
+_curv_meshes(::Type{T}) where {T} = (
+    ("cubed_square",    make_cubed_square_mesh(T, 2, T(0.3))),
+    ("inflated_square", make_inflated_square_mesh(T, T(0.2), T(0.5), T(1.0), 2)),
+)
 
 @isdefined(_progress) ||
     (_progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
@@ -15,27 +23,22 @@ using Test
     T = Float64; N = 4
 
     _progress("free-stream (∇const = 0, ∇·const = 0)")
-    @testset "free-stream preservation" begin
-        for M in (2, 3)
-            mesh = make_cubed_square_mesh(T, M, T(0.3))
-            elem = make_element(T, N); ops = make_operators(elem)
-            geom = make_geometry(mesh, elem); metric = make_metric_terms2d(geom, ops)
-            Ne = geom.Ne
-            g1 = zeros(T, N, N, Ne); g2 = similar(g1)
-            apply_gradient2d!(g1, g2, fill(T(2.5), N, N, Ne); geom, ops, metric)
-            @test maximum(abs, g1) ≤ 1e-10
-            @test maximum(abs, g2) ≤ 1e-10
-            dv = similar(g1)
-            apply_divergence2d!(dv, fill(T(1.3), N, N, Ne), fill(T(-0.7), N, N, Ne);
-                                geom, ops, metric)
-            @test maximum(abs, dv) ≤ 1e-10
-        end
+    @testset "free-stream preservation [$name]" for (name, mesh) in _curv_meshes(T)
+        elem = make_element(T, N); ops = make_operators(elem)
+        geom = make_geometry(mesh, elem); metric = make_metric_terms2d(geom, ops)
+        Ne = geom.Ne
+        g1 = zeros(T, N, N, Ne); g2 = similar(g1)
+        apply_gradient2d!(g1, g2, fill(T(2.5), N, N, Ne); geom, ops, metric)
+        @test maximum(abs, g1) ≤ 1e-10
+        @test maximum(abs, g2) ≤ 1e-10
+        dv = similar(g1)
+        apply_divergence2d!(dv, fill(T(1.3), N, N, Ne), fill(T(-0.7), N, N, Ne);
+                            geom, ops, metric)
+        @test maximum(abs, dv) ≤ 1e-10
     end
 
     _progress("interior skew-adjointness (gradient = −divergence*)")
-    @testset "interior gradient/divergence skew-adjoint" begin
-        M = 2
-        mesh = make_cubed_square_mesh(T, M, T(0.3))
+    @testset "interior gradient/divergence skew-adjoint [$name]" for (name, mesh) in _curv_meshes(T)
         elem = make_element(T, N); ops = make_operators(elem)
         geom = make_geometry(mesh, elem); metric = make_metric_terms2d(geom, ops)
         Ne = geom.Ne; n = N*N*Ne
