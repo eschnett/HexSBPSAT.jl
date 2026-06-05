@@ -74,6 +74,8 @@ include("kernels2d.jl")
 # Multi-dimensional axis-selective first derivative (`apply_D!(…, d)`),
 # the building block for the conservative first-order scalar wave.
 include("kernels2d_grad.jl")
+# 3D axis-selective first derivative `apply_D!(…, d)` (affine).
+include("kernels3d_grad.jl")
 # Curvilinear 2D conservative gradient/divergence (free-stream-
 # preserving, discrete metric terms).
 include("kernels2d_curv.jl")
