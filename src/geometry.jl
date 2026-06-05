@@ -281,7 +281,8 @@ Move every kernel-read array of `mesh` / `geom` onto `backend` (a
 `MetalBackend()`, `ROCBackend()`). For `mesh`, this migrates the four
 connectivity matrices; the host-only `vertex_coords` / `vertex_idx`
 are left as plain CPU `Matrix`. For `geom`, it migrates `coords`,
-`jac`, `invjac`, `detjac`, `handedness`, and the embedded mesh.
+`jac`, `invjac`, `dinvjac`, `detjac`, `Hphys`, `handedness`, and the
+embedded mesh.
 
 The CPU → CPU case is a no-op-shaped copy: every allocation goes
 through `KernelAbstractions.allocate(backend, …)` which on the CPU
