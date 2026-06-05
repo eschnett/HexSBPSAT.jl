@@ -68,6 +68,23 @@ function make_metric_terms2d(geom::MeshGeometry{2, T, N}, ops::SBPOps{N, T}) whe
     return (; ax1, ax2, ay1, ay2, invdetJ, Hd)
 end
 
+"""
+    metric_to_device(metric, backend) → NamedTuple
+
+Migrate the discrete metric-term bundle from [`make_metric_terms2d`]
+(`ax1, ax2, ay1, ay2, invdetJ, Hd`) onto `backend` (the curvilinear
+operators read these on-device). `make_metric_terms2d` runs on the
+HOST geom (a scalar nodal loop), so a GPU caller computes the terms on
+the host geom and then migrates them with this helper.
+"""
+function metric_to_device(metric, backend)
+    _mv(a) = (d = KernelAbstractions.allocate(backend, eltype(a), size(a));
+              copyto!(d, a); d)
+    return (; ax1 = _mv(metric.ax1), ax2 = _mv(metric.ax2),
+            ay1 = _mv(metric.ay1), ay2 = _mv(metric.ay2),
+            invdetJ = _mv(metric.invdetJ), Hd = _mv(metric.Hd))
+end
+
 # (i,j) of face node `p` on face `f` (1,2 → normal axis ξ; 3,4 → η),
 # at row `isodd(f) ? 1 : N`.
 @inline function _facenode2d(f, p, ::Val{N}) where {N}
