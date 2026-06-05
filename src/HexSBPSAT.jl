@@ -79,6 +79,9 @@ include("kernels3d_grad.jl")
 # Curvilinear 2D conservative gradient/divergence (free-stream-
 # preserving, discrete metric terms).
 include("kernels2d_curv.jl")
+# Curvilinear 3D conservative metric terms (conservative-curl form) +
+# gradient/divergence.
+include("kernels3d_curv.jl")
 
 export
     # Reference element + 1D operators
@@ -88,8 +91,9 @@ export
     # Connectivity-driven 1D first derivative (SBP-G + centred-flux SAT)
     apply_D!,
     # Curvilinear 2D conservative gradient/divergence + metric terms
-    make_metric_terms2d, metric_to_device,
+    make_metric_terms2d, make_metric_terms3d, metric_to_device,
     apply_gradient2d!, apply_divergence2d!,
+    apply_gradient3d!, apply_divergence3d!,
     # Operator-aware geometry (dimension-generic in `D ∈ {2, 3}`) +
     # the per-call scratch workspace that goes with it.
     MeshGeometry, make_geometry, element_coords,

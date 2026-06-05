@@ -77,12 +77,10 @@ operators read these on-device). `make_metric_terms2d` runs on the
 HOST geom (a scalar nodal loop), so a GPU caller computes the terms on
 the host geom and then migrates them with this helper.
 """
-function metric_to_device(metric, backend)
+function metric_to_device(metric::NamedTuple, backend)
     _mv(a) = (d = KernelAbstractions.allocate(backend, eltype(a), size(a));
               copyto!(d, a); d)
-    return (; ax1 = _mv(metric.ax1), ax2 = _mv(metric.ax2),
-            ay1 = _mv(metric.ay1), ay2 = _mv(metric.ay2),
-            invdetJ = _mv(metric.invdetJ), Hd = _mv(metric.Hd))
+    return NamedTuple{keys(metric)}(map(_mv, values(metric)))
 end
 
 # (i,j) of face node `p` on face `f` (1,2 → normal axis ξ; 3,4 → η),
