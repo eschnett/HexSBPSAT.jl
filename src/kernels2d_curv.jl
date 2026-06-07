@@ -71,7 +71,7 @@ end
 """
     metric_to_device(metric, backend) → NamedTuple
 
-Migrate the discrete metric-term bundle from [`make_metric_terms2d`]
+Migrate the discrete metric-term bundle from [`make_metric_terms2d`](@ref)
 (`ax1, ax2, ay1, ay2, invdetJ, Hd`) onto `backend` (the curvilinear
 operators read these on-device). `make_metric_terms2d` runs on the
 HOST geom (a scalar nodal loop), so a GPU caller computes the terms on
