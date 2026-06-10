@@ -140,15 +140,22 @@ struct MeshWorkspace{D, T, N, AF}
 end
 
 """
-    make_workspace(geom::MeshGeometry{D, T, N}) → MeshWorkspace{D, T, N}
+    make_workspace(geom::MeshGeometry{D, T, N}; nchannels = 4)
+        → MeshWorkspace{D, T, N}
 
 Allocate a fresh `MeshWorkspace` matching `geom`'s backend, element
 count, and polynomial order. The buffer's element type is `T` and its
-shape depends on `D` — see [`MeshWorkspace`](@ref).
+shape depends on `D` — see [`MeshWorkspace`](@ref). In 3D, `nchannels`
+sizes the face-trace channel dimension: the default 4 serves all scalar
+operators; the channel-batched operators (`apply_D_batch!`,
+`apply_gradient3d_batch!`, `apply_divergence3d_batch!`) need
+`nchannels ≥ C` (gather/gradient) or `≥ 3C` (divergence) for C fields.
 """
-function make_workspace(geom::MeshGeometry{3, T, N}) where {T, N}
+function make_workspace(geom::MeshGeometry{3, T, N};
+                        nchannels::Int = 4) where {T, N}
     backend = KernelAbstractions.get_backend(geom.coords)
-    ft = KernelAbstractions.allocate(backend, T, 4, N, N, 6, geom.Ne)
+    nc = max(nchannels, 4)
+    ft = KernelAbstractions.allocate(backend, T, nc, N, N, 6, geom.Ne)
     return MeshWorkspace{3, T, N}(ft)
 end
 

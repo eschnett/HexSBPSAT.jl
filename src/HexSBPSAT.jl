@@ -82,6 +82,9 @@ include("kernels2d_curv.jl")
 # Curvilinear 3D conservative metric terms (conservative-curl form) +
 # gradient/divergence.
 include("kernels3d_curv.jl")
+# Channel-batched 3D operators (one launch for C fields; multi-field
+# systems like the generalized harmonic equations).
+include("kernels3d_batch.jl")
 
 export
     # Reference element + 1D operators
@@ -94,6 +97,8 @@ export
     make_metric_terms2d, make_metric_terms3d, metric_to_device,
     apply_gradient2d!, apply_divergence2d!,
     apply_gradient3d!, apply_divergence3d!,
+    # Channel-batched 3D operators (trailing channel dimension)
+    apply_D_batch!, apply_gradient3d_batch!, apply_divergence3d_batch!,
     # Operator-aware geometry (dimension-generic in `D ∈ {2, 3}`) +
     # the per-call scratch workspace that goes with it.
     MeshGeometry, make_geometry, element_coords,
