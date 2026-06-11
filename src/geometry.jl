@@ -198,7 +198,12 @@ function make_geometry(mesh::Mesh{3, T}, elem) where {T}
     Hphys      = Array{T, 4}(undef, N, N, N, Ne)
     handedness = Vector{Int8}(undef, Ne)
 
-    @inbounds for e in 1:Ne
+    # Threaded over elements: every iteration writes only its own
+    # element's slices (pure per-element evaluation of the analytic
+    # maps), so this is embarrassingly parallel — and it dominates the
+    # mesh-setup wall time at production sizes.
+    Threads.@threads :static for e in 1:Ne
+        @inbounds begin
         pd  = mesh.patch_desc[mesh.patch_id[e]]
         # Trilinear path for `Cubic` only (the cubic map is linear so
         # trilinear is exact). Analytic `_patch_point_and_jac` for the
@@ -245,6 +250,7 @@ function make_geometry(mesh::Mesh{3, T}, elem) where {T}
                 Hphys[i, j, k, e]  = H_1d[i] * H_1d[j] * H_1d[k] * dJ
             end
         end
+        end # @inbounds
     end
 
     # Populate dinvjac[α, a, b, i, j, k, e] = ∂_b (invjac[α, a]).
@@ -252,8 +258,9 @@ function make_geometry(mesh::Mesh{3, T}, elem) where {T}
     # physical coordinates via invjac itself:
     #   D̂_c (J⁻¹)[α, a]      = (G_ref · invjac[α, a, ·])  along axis c
     #   ∂_b (J⁻¹)[α, a]      = (J⁻¹)[c, b] · D̂_c (J⁻¹)[α, a]
-    @inbounds for e in 1:Ne
-        for k in 1:N, j in 1:N, i in 1:N
+    # (Also threaded: reads invjac anywhere, writes only element e.)
+    Threads.@threads :static for e in 1:Ne
+        @inbounds for k in 1:N, j in 1:N, i in 1:N
             for α in 1:3, a in 1:3
                 d1 = zero(T); d2 = zero(T); d3 = zero(T)
                 for p in 1:N
