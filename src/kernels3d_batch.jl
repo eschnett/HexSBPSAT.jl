@@ -98,12 +98,12 @@ function apply_D_batch!(Du::AbstractArray{T,5}, u::AbstractArray{T,5},
                         d::Integer; geom::MeshGeometry{3, T, N},
                         ops::SBPOps{N, T}, work::MeshWorkspace{3, T, N},
                         scale = one(T),
-                        accumulate::Val = Val(false)) where {N, T}
+                        accumulate::Val = Val(false),
+                        backend = get_backend(u)) where {N, T}
     C = size(u, 5)
     @assert size(u) == size(Du) == (N, N, N, geom.Ne, C)
     @assert size(work.face_trace, 1) >= C
     @assert 1 <= d <= 3
-    backend = get_backend(u)
     ft = _trace_channels_last(work, geom.Ne, Val(N))
     _gather_face3d_batch!(backend, (N, N, N))(
         u, ft, geom.conn.bdry, Val(N); ndrange = (N, N, N, geom.Ne, C))
@@ -194,12 +194,12 @@ function apply_gradient3d_batch!(g1::AbstractArray{T,5},
                                  g3::AbstractArray{T,5},
                                  u::AbstractArray{T,5};
                                  geom::MeshGeometry{3,T,N}, ops::SBPOps{N,T},
-                                 metric, work::MeshWorkspace{3,T,N}) where {T,N}
+                                 metric, work::MeshWorkspace{3,T,N},
+                                 backend = get_backend(u)) where {T,N}
     C = size(u, 5)
     @assert size(u) == size(g1) == size(g2) == size(g3) ==
             (N, N, N, geom.Ne, C)
     @assert size(work.face_trace, 1) >= C
-    backend = get_backend(u)
     ft = _trace_channels_last(work, geom.Ne, Val(N))
     _gather_face3d_batch!(backend, (N, N, N))(
         u, ft, geom.conn.bdry, Val(N); ndrange = (N, N, N, geom.Ne, C))
@@ -282,12 +282,12 @@ function apply_divergence3d_batch!(divF::AbstractArray{T,5},
                                    geom::MeshGeometry{3,T,N}, ops::SBPOps{N,T},
                                    metric, work::MeshWorkspace{3,T,N},
                                    add::Union{Nothing,AbstractArray{T,5}} =
-                                       nothing) where {T,N}
+                                       nothing,
+                                   backend = get_backend(divF)) where {T,N}
     C = size(F1, 5)
     @assert size(F1) == size(F2) == size(F3) == size(divF) ==
             (N, N, N, geom.Ne, C)
     @assert size(work.face_trace, 1) >= 3C
-    backend = get_backend(divF)
     ft = _trace_channels_last(work, geom.Ne, Val(N))
     _gather_face3d_batch3!(backend, (N, N, N))(
         F1, F2, F3, ft, geom.conn.bdry, Val(N);
