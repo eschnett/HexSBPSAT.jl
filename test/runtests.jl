@@ -39,6 +39,7 @@ _progress(msg) = (printstyled(stderr, "  • ", msg, "\n"; color = :cyan);
     _section("test_curvilinear2d.jl");      include("test_curvilinear2d.jl")
     _section("test_curvilinear3d.jl");      include("test_curvilinear3d.jl")
     _section("test_kernels3d_batch.jl");    include("test_kernels3d_batch.jl")
+    _section("test_kernels3d_batch_cpu.jl"); include("test_kernels3d_batch_cpu.jl")
     _section("test_geometry.jl");           include("test_geometry.jl")
     _section("test_apply_laplacian3d.jl");  include("test_apply_laplacian3d.jl")
     _section("test_apply_laplacian2d.jl");  include("test_apply_laplacian2d.jl")

@@ -102,21 +102,42 @@ function apply_D_batch!(Du::AbstractArray{T,5}, u::AbstractArray{T,5},
                         backend = get_backend(u)) where {N, T}
     C = size(u, 5)
     @assert size(u) == size(Du) == (N, N, N, geom.Ne, C)
-    @assert size(work.face_trace, 1) >= C
     @assert 1 <= d <= 3
+    # CPU fast path (kernels3d_batch_cpu.jl): SIMD pencil loops, direct
+    # neighbour reads (the face-trace pool is NOT populated), bitwise-
+    # identical results. GPU backends use the KA kernels.
+    # HEXSBPSAT_NO_CPU_FASTPATH=1 forces the KA path (benchmarking only).
+    if backend isa CPU && get(ENV, "HEXSBPSAT_NO_CPU_FASTPATH", "0") != "1"
+        return _apply_D_batch_cpu!(Du, u, Val(Int(d)); geom, ops,
+                                   scale = T(scale), accumulate)
+    end
+    return _apply_D_batch_ka!(Du, u, d; geom, ops, work,
+                              scale = T(scale), accumulate, backend)
+end
+
+# The KernelAbstractions implementation — the GPU path, also directly
+# callable on CPU (the bitwise KA-vs-fast-path tests rely on this).
+function _apply_D_batch_ka!(Du::AbstractArray{T,5}, u::AbstractArray{T,5},
+                            d::Integer; geom::MeshGeometry{3, T, N},
+                            ops::SBPOps{N, T}, work::MeshWorkspace{3, T, N},
+                            scale::T = one(T),
+                            accumulate::Val = Val(false),
+                            backend = get_backend(u)) where {N, T}
+    C = size(u, 5)
+    @assert size(work.face_trace, 1) >= C
     ft = _trace_channels_last(work, geom.Ne, Val(N))
     _gather_face3d_batch!(backend, (N, N, N))(
         u, ft, geom.conn.bdry, Val(N); ndrange = (N, N, N, geom.Ne, C))
     _apply_D_3d_volume_batch_kernel!(backend, (N^3, 1))(
         Du, u, ft, ops, geom.conn.neighbour, geom.conn.neighbour_face,
-        geom.conn.orientation, geom.conn.bdry, geom.invjac, T(scale),
+        geom.conn.orientation, geom.conn.bdry, geom.invjacd, scale,
         accumulate, Val(Int(d)), Val(N); ndrange = (N^3 * geom.Ne, C))
     return Du
 end
 
 @kernel function _apply_D_3d_volume_batch_kernel!(
         Du::AbstractArray{T}, @Const(u), ft, ops, @Const(neighbour),
-        @Const(nbr_face), @Const(orient), @Const(bdry), @Const(invjac),
+        @Const(nbr_face), @Const(orient), @Const(bdry), @Const(invjacd),
         scale::T, ::Val{ACC}, ::Val{d}, ::Val{N}) where {T, ACC, d, N}
     ge = @index(Group, NTuple)
     li = @index(Local, Linear)
@@ -137,22 +158,22 @@ end
         @inbounds for p in 1:N
             s += G[i, p] * u_loc[p, j, k]
         end
-        @inbounds s *= invjac[1, 1, i, j, k, e]
+        @inbounds s *= invjacd[i, j, k, e, 1]
     elseif d == 2
         @inbounds for p in 1:N
             s += G[j, p] * u_loc[i, p, k]
         end
-        @inbounds s *= invjac[2, 2, i, j, k, e]
+        @inbounds s *= invjacd[i, j, k, e, 2]
     else
         @inbounds for p in 1:N
             s += G[k, p] * u_loc[i, j, p]
         end
-        @inbounds s *= invjac[3, 3, i, j, k, e]
+        @inbounds s *= invjacd[i, j, k, e, 3]
     end
 
     @inbounds begin
         ia  = d == 1 ? i : d == 2 ? j : k
-        idJ = invjac[d, d, i, j, k, e]
+        idJ = invjacd[i, j, k, e, d]
         if ia == 1 && bdry[2d - 1, e] == 0
             nbr = Int(neighbour[2d-1, e]); nf = Int(nbr_face[2d-1, e])
             o   = orient[2d-1, e]
@@ -199,6 +220,26 @@ function apply_gradient3d_batch!(g1::AbstractArray{T,5},
     C = size(u, 5)
     @assert size(u) == size(g1) == size(g2) == size(g3) ==
             (N, N, N, geom.Ne, C)
+    # CPU fast path (kernels3d_batch_cpu.jl); bitwise-identical, leaves
+    # the face-trace pool untouched. GPU backends use the KA kernels.
+    if backend isa CPU && get(ENV, "HEXSBPSAT_NO_CPU_FASTPATH", "0") != "1"
+        return _apply_gradient3d_batch_cpu!(g1, g2, g3, u; geom, ops, metric)
+    end
+    return _apply_gradient3d_batch_ka!(g1, g2, g3, u; geom, ops, metric,
+                                       work, backend)
+end
+
+# The KernelAbstractions implementation — the GPU path, also directly
+# callable on CPU (the bitwise KA-vs-fast-path tests rely on this).
+function _apply_gradient3d_batch_ka!(g1::AbstractArray{T,5},
+                                     g2::AbstractArray{T,5},
+                                     g3::AbstractArray{T,5},
+                                     u::AbstractArray{T,5};
+                                     geom::MeshGeometry{3,T,N},
+                                     ops::SBPOps{N,T},
+                                     metric, work::MeshWorkspace{3,T,N},
+                                     backend = get_backend(u)) where {T,N}
+    C = size(u, 5)
     @assert size(work.face_trace, 1) >= C
     ft = _trace_channels_last(work, geom.Ne, Val(N))
     _gather_face3d_batch!(backend, (N, N, N))(
@@ -287,6 +328,29 @@ function apply_divergence3d_batch!(divF::AbstractArray{T,5},
     C = size(F1, 5)
     @assert size(F1) == size(F2) == size(F3) == size(divF) ==
             (N, N, N, geom.Ne, C)
+    # CPU fast path (kernels3d_batch_cpu.jl); bitwise-identical, leaves
+    # the face-trace pool untouched. GPU backends use the KA kernels.
+    if backend isa CPU && get(ENV, "HEXSBPSAT_NO_CPU_FASTPATH", "0") != "1"
+        return _apply_divergence3d_batch_cpu!(divF, F1, F2, F3; geom, ops,
+                                              metric, add)
+    end
+    return _apply_divergence3d_batch_ka!(divF, F1, F2, F3; geom, ops,
+                                         metric, work, add, backend)
+end
+
+# The KernelAbstractions implementation — the GPU path, also directly
+# callable on CPU (the bitwise KA-vs-fast-path tests rely on this).
+function _apply_divergence3d_batch_ka!(divF::AbstractArray{T,5},
+                                       F1::AbstractArray{T,5},
+                                       F2::AbstractArray{T,5},
+                                       F3::AbstractArray{T,5};
+                                       geom::MeshGeometry{3,T,N},
+                                       ops::SBPOps{N,T},
+                                       metric, work::MeshWorkspace{3,T,N},
+                                       add::Union{Nothing,AbstractArray{T,5}} =
+                                           nothing,
+                                       backend = get_backend(divF)) where {T,N}
+    C = size(F1, 5)
     @assert size(work.face_trace, 1) >= 3C
     ft = _trace_channels_last(work, geom.Ne, Val(N))
     _gather_face3d_batch3!(backend, (N, N, N))(

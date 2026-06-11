@@ -18,13 +18,9 @@ jobs:
       with:
         version: '1.10'
     - name: Install dependencies
-      # `Pkg.develop(url=...)` injects the unregistered `HexMeshes`
-      # dependency from GitHub. Delete that line once `HexMeshes` is
-      # registered in the General registry.
       run: |
         julia --project=docs/ -e '
           using Pkg
-          Pkg.develop(url = "https://github.com/eschnett/HexMeshes.jl.git")
           Pkg.develop(PackageSpec(path = pwd()))
           Pkg.instantiate()
         '

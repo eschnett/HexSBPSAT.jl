@@ -53,19 +53,6 @@ jobs:
           version: ${{ matrix.version }}
           arch: ${{matrix.arch}}
       - uses: julia-actions/cache@v3
-
-      # `HexMeshes` is not yet in the General registry. Until it is,
-      # inject it as a Git-tracked dependency so `Pkg.instantiate()`
-      # (called by `julia-buildpkg` below) and the test-env build
-      # (`julia-runtest`) can both resolve it. Tracks the `main` branch
-      # by default; pin to a specific commit if reproducible CI is
-      # needed. Delete this step once `HexMeshes` is registered.
-      - name: Install unregistered HexMeshes dependency from GitHub
-        shell: julia --color=yes --project=. {0}
-        run: |
-          using Pkg
-          Pkg.develop(url = "https://github.com/eschnett/HexMeshes.jl.git")
-
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
       - uses: julia-actions/julia-processcoverage@v1

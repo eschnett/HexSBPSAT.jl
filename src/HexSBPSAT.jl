@@ -85,6 +85,7 @@ include("kernels3d_curv.jl")
 # Channel-batched 3D operators (one launch for C fields; multi-field
 # systems like the generalized harmonic equations).
 include("kernels3d_batch.jl")
+include("kernels3d_batch_cpu.jl")
 
 export
     # Reference element + 1D operators
